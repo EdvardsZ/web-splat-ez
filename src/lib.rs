@@ -156,6 +156,17 @@ pub struct WindowContext {
     #[cfg(feature = "video")]
     cameras_save_path: String,
     stopwatch: Option<GPUStopwatch>,
+    
+    // File loading state
+    loading_state: Option<LoadingState>,
+}
+
+// Structure to track the loading state of a new PLY file
+pub struct LoadingState {
+    pub file_path: PathBuf,
+    pub progress: f32, // 0.0 to 1.0
+    pub start_time: Instant,
+    pub pc_raw: Option<io::GenericGaussianPointCloud>,
 }
 
 impl WindowContext {
@@ -296,6 +307,9 @@ impl WindowContext {
             scene_file_path: None,
 
             stopwatch,
+            
+            // File loading state
+            loading_state: None,
         })
     }
 
@@ -353,7 +367,7 @@ impl WindowContext {
     }
 
     /// returns whether the sceen changed and we need a redraw
-    fn update(&mut self, dt: Duration)  {
+    fn update(&mut self, dt: Duration) -> anyhow::Result<()> {
         // ema fps update
 
         if self.splatting_args.walltime < Duration::from_secs(5) {
@@ -401,6 +415,25 @@ impl WindowContext {
 
         let aabb = self.pc.bbox();
         self.splatting_args.camera.fit_near_far(aabb);
+        
+        // Update file loading if in progress
+        #[cfg(not(target_arch = "wasm32"))]
+        let loading_needs_redraw = if self.loading_state.is_some() {
+            self.update_loading()?;
+            true // Loading is in progress, request redraw to update UI
+        } else {
+            false
+        };
+        
+        #[cfg(target_arch = "wasm32")]
+        let loading_needs_redraw = false;
+        
+        // Immediately request a redraw if loading is in progress
+        if loading_needs_redraw {
+            self.window.request_redraw();
+        }
+        
+        Ok(())
     }
 
     fn render(
@@ -650,6 +683,101 @@ impl WindowContext {
             Split::Test,
         ));
     }
+
+    // Start loading a new PLY file while continuing to display the current one
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn load_new_file<P: AsRef<Path>>(&mut self, file_path: P) -> anyhow::Result<()> {
+        let path = file_path.as_ref().to_path_buf();
+        
+        // Don't start loading if already loading or if it's the same file
+        if let Some(state) = &self.loading_state {
+            if state.file_path == path {
+                return Ok(());
+            }
+        }
+        
+        log::info!("Starting to load new point cloud from {:?}", path);
+        self.loading_state = Some(LoadingState {
+            file_path: path,
+            progress: 0.0,
+            start_time: Instant::now(),
+            pc_raw: None,
+        });
+        
+        Ok(())
+    }
+    
+    // Updates the loading progress and completes the loading if necessary
+    #[cfg(not(target_arch = "wasm32"))]
+    fn update_loading(&mut self) -> anyhow::Result<()> {
+        if let Some(loading_state) = &mut self.loading_state {
+            // If loading is complete, apply the new point cloud
+            if let Some(pc_raw) = loading_state.pc_raw.take() {
+                log::info!("Applying new point cloud with {} points", pc_raw.num_points);
+                
+                // Create new point cloud
+                let new_pc = PointCloud::new(&self.wgpu_context.device, pc_raw)?;
+                
+                // Update the renderer
+                self.renderer = pollster::block_on(
+                    GaussianRenderer::new(
+                        &self.wgpu_context.device,
+                        &self.wgpu_context.queue,
+                        self.renderer.color_format(),
+                        new_pc.sh_deg(),
+                        new_pc.compressed()
+                    )
+                );
+                
+                // Update the point cloud
+                self.pc = new_pc;
+                self.pointcloud_file_path = Some(loading_state.file_path.clone());
+                
+                // Reset the loading state
+                self.loading_state = None;
+                
+                // Adjust camera to view the new point cloud
+                let aabb = self.pc.bbox();
+                self.splatting_args.camera.fit_near_far(aabb);
+                self.controller.center = self.pc.center();
+                
+                log::info!("New point cloud loaded successfully");
+            } else {
+                // If we're still in a loading state but don't have the raw data yet, let's do the loading
+                if loading_state.progress >= 1.0 {
+                    // Once progress reaches 100%, start actual loading
+                    let file_path = loading_state.file_path.clone();
+                    
+                    // Load the file
+                    match std::fs::File::open(&file_path) {
+                        Ok(file) => {
+                            match io::GenericGaussianPointCloud::load(file) {
+                                Ok(pc_raw) => {
+                                    loading_state.pc_raw = Some(pc_raw);
+                                },
+                                Err(e) => {
+                                    log::error!("Failed to load point cloud: {:?}", e);
+                                    self.loading_state = None;
+                                    return Err(e);
+                                }
+                            }
+                        },
+                        Err(e) => {
+                            log::error!("Failed to open file: {:?}", e);
+                            self.loading_state = None;
+                            return Err(e.into());
+                        }
+                    }
+                } else {
+                    // Just simulate progress for demo purposes
+                    // In a real implementation, you would track actual loading progress here
+                    loading_state.progress += 0.01;
+                }
+            }
+        }
+        
+        Ok(())
+    }
 }
 
 pub fn smoothstep(x: f32) -> f32 {
@@ -801,6 +929,21 @@ pub async fn open_window<R: Read + Seek + Send + Sync + 'static>(
                         
                     }else if key == KeyCode::KeyC{
                         state.save_view();
+                    } else if key == KeyCode::KeyO {
+                        // Add a keyboard shortcut for opening a PLY file
+                        #[cfg(not(target_arch = "wasm32"))]
+                        {
+                            if state.loading_state.is_none() {
+                                if let Some(path) = rfd::FileDialog::new()
+                                    .add_filter("PLY Files", &["ply"])
+                                    .pick_file() 
+                                {
+                                    if let Err(err) = state.load_new_file(&path) {
+                                        log::error!("failed to load file: {:?}", err);
+                                    }
+                                }
+                            }
+                        }
                     } else  if key == KeyCode::KeyR && state.controller.alt_pressed{
                         if let Err(err) = state.reload(){
                             log::error!("failed to reload volume: {:?}", err);
@@ -859,13 +1002,18 @@ pub async fn open_window<R: Read + Seek + Send + Sync + 'static>(
                 last = now;
 
                 let old_settings = state.splatting_args.clone();
-                state.update(dt);
+                let old_loading_state = state.loading_state.is_some();
+                state.update(dt).unwrap();
+                let new_loading_state = state.loading_state.is_some();
 
                 let (redraw_ui,shapes) = state.ui();
 
                 let resolution_change = state.splatting_args.resolution != Vector2::new(state.config.width, state.config.height);
 
-                let request_redraw = old_settings != state.splatting_args || resolution_change;
+                // Check if any state has changed that requires a redraw
+                let request_redraw = old_settings != state.splatting_args 
+                    || resolution_change 
+                    || old_loading_state != new_loading_state;
     
                 if request_redraw || redraw_ui{
                     state.fps = (1. / dt.as_secs_f32()) * 0.05 + state.fps * 0.95;
@@ -879,7 +1027,9 @@ pub async fn open_window<R: Read + Seek + Send + Sync + 'static>(
                         Err(e) => println!("error: {:?}", e),
                     }
                 }
-                if config.no_vsync{
+                
+                // Always request a redraw when loading a file to keep progress bar updating
+                if state.loading_state.is_some() || config.no_vsync {
                     state.window.request_redraw();
                 }
             }

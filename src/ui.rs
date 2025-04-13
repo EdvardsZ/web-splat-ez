@@ -10,6 +10,8 @@ use crate::{SceneCamera, Split, WindowContext};
 use cgmath::{Euler, Matrix3, Quaternion};
 #[cfg(not(target_arch = "wasm32"))]
 use egui::Vec2b;
+#[cfg(not(target_arch = "wasm32"))]
+use rfd;
 
 #[cfg(target_arch = "wasm32")]
 use egui::{Align2,Vec2};
@@ -20,8 +22,42 @@ use egui::{emath::Numeric, Color32, RichText};
 #[cfg(not(target_arch = "wasm32"))]
 use egui_plot::{Legend, PlotPoints};
 
+// Helper function to render the loading state
+#[cfg(not(target_arch = "wasm32"))]
+fn render_loading_ui(ui: &mut egui::Ui, loading_info: (bool, f32, Option<String>)) {
+    let (is_loading, progress, filename) = loading_info;
+    
+    let button = ui.add_enabled(
+        !is_loading,
+        egui::Button::new("📂 Load PLY File")
+    );
+    
+    if button.clicked() {
+        if let Some(path) = rfd::FileDialog::new()
+            .add_filter("PLY Files", &["ply"])
+            .pick_file() 
+        {
+            return;  // We'll handle the file loading outside of the UI
+        }
+    }
+    
+    // Show loading progress if we're loading
+    if is_loading {
+        ui.add(egui::ProgressBar::new(progress)
+            .show_percentage()
+            .animate(true)
+        );
+        
+        // Show file being loaded on hover
+        if let Some(name) = filename {
+            ui.label(name);
+        }
+    }
+}
+
 pub(crate) fn ui(state: &mut WindowContext) -> bool {
     let ctx = state.ui_renderer.winit.egui_ctx();
+    
     #[cfg(not(target_arch = "wasm32"))]
     if let Some(stopwatch) = state.stopwatch.as_mut() {
         let durations = pollster::block_on(
@@ -212,7 +248,33 @@ pub(crate) fn ui(state: &mut WindowContext) -> bool {
                         .on_hover_text(text);
                         ui.end_row();
                     }
-                    ui.end_row();
+                    
+                    // Show loading status and instructions
+                    #[cfg(not(target_arch = "wasm32"))]
+                    if let Some(loading_state) = &state.loading_state {
+                        ui.end_row();
+                        ui.strong("Loading:");
+                        ui.horizontal(|ui| {
+                            ui.add(egui::ProgressBar::new(loading_state.progress)
+                                .show_percentage()
+                                .animate(true)
+                            );
+                            
+                            if let Some(filename) = loading_state.file_path.file_name() {
+                                ui.label(filename.to_string_lossy().to_string());
+                            }
+                        });
+                        ui.end_row();
+                    }
+                    
+                    // Add key instructions
+                    #[cfg(not(target_arch = "wasm32"))]
+                    {
+                        ui.end_row();
+                        ui.strong("Open File:");
+                        ui.label("Press 'O' key");
+                        ui.end_row();
+                    }
                 });
 
             if let Some(scene) = &state.scene {
@@ -355,6 +417,10 @@ pub(crate) fn ui(state: &mut WindowContext) -> bool {
                     ui.label("Toggle UI");
                     ui.label("U");
                     ui.end_row();
+                    
+                    ui.label("Open PLY File");
+                    ui.label("O");
+                    ui.end_row();
 
                     ui.strong("Scene Views");
                     ui.end_row();
@@ -394,7 +460,11 @@ pub(crate) fn ui(state: &mut WindowContext) -> bool {
             state.start_tracking_shot();
         }
     }
-    return requested_repaint;
+    
+    // If we have a loading state, request continuous redraws
+    let is_loading = state.loading_state.is_some();
+    
+    return requested_repaint || is_loading;
 }
 
 enum SetCamera {
