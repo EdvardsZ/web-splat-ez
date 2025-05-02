@@ -234,16 +234,16 @@ impl WindowContext {
             GaussianRenderer::new(&device, &queue, render_format, pc.sh_deg(), pc.compressed())
                 .await;
 
-        let aabb = pc.bbox();
         let aspect = size.width as f32 / size.height as f32;
         let view_camera = PerspectiveCamera::new(
-            aabb.center() - Vector3::new(1., 1., 1.) * aabb.radius() * 0.5,
+            //aabb.center() - Vector3::new(1., 1., 1.) * aabb.radius() * 0.5,
+            Point3::new(0., 0., 0.),
             Quaternion::one(),
             PerspectiveProjection::new(
                 Vector2::new(size.width, size.height),
-                Vector2::new(Deg(45.), Deg(45. / aspect)),
+                Vector2::new(Deg(90.), Deg(90. / aspect)),
                 0.01,
-                1000.,
+                10.,
             ),
         );
 
