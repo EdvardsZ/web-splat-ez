@@ -43,6 +43,7 @@ splines = { features = [
 ], git = "https://github.com/KeKsBoTer/splines" }
 
 cfg-if = "1.0"
+gloo-timers = { version = "0.3.0", features = ["futures"] }
 
 [dev-dependencies]
 wasm-bindgen-cli = "0.2.92"

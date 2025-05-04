@@ -22,7 +22,11 @@ use utils::key_to_num;
 use utils::RingBuffer;
 
 #[cfg(target_arch = "wasm32")]
-use wasm_bindgen::prelude::wasm_bindgen;
+use {
+    wasm_bindgen::prelude::*,
+    wasm_bindgen_futures,
+    gloo_timers,
+};
 use winit::{
     dpi::{LogicalSize, PhysicalSize},
     event::{DeviceEvent, ElementState, Event, WindowEvent},
@@ -184,7 +188,7 @@ pub struct LoadingState {
 // Shared state for communicating async results back to the main thread
 struct SharedState {
     file_load_request: Mutex<Option<(Vec<u8>, String)>>, // (file_data, file_name)
-    new_renderer_result: Mutex<Option<GaussianRenderer>>,
+    new_renderer_result: Mutex<Option<(GaussianRenderer, PointCloud)>>, // Now holds both renderer and point cloud
 }
 
 impl WindowContext {
@@ -441,28 +445,43 @@ impl WindowContext {
         self.splatting_args.camera.fit_near_far(aabb);
         
         // Check if async renderer creation has finished (WASM)
-        if let Some(new_renderer) = self.shared_state.new_renderer_result.lock().unwrap().take() {
+        if let Some((new_renderer, new_pc)) = self.shared_state.new_renderer_result.lock().unwrap().take() {
             if let Some(loading_state) = &mut self.loading_state {
-                if let Some(new_pc) = loading_state.pending_pc.take() {
-                    log::info!("Applying newly created renderer and point cloud.");
-                    self.renderer = new_renderer;
-                    self.pc = new_pc;
-                    self.pointcloud_file_path = Some(loading_state.file_path.clone());
-                    
-                    // Adjust camera to view the new point cloud
-                    let aabb = self.pc.bbox();
-                    self.splatting_args.camera.fit_near_far(aabb);
-                    self.controller.center = self.pc.center();
-
-                    self.loading_state = None; // Finished loading
-                    self.window.request_redraw(); // Ensure redraw
-                    log::info!("New point cloud applied successfully.");
-                } else {
-                    log::error!("Renderer result found, but no pending point cloud in loading state!");
-                    self.loading_state = None; // Clear broken state
-                }
+                log::info!("New point cloud fully loaded and ready to apply");
+                
+                // Important: First request a redraw of the current point cloud
+                // This ensures we have a fully rendered frame with the old point cloud
+                self.window.request_redraw();
+                
+                // Make a backup of old camera parameters
+                let old_camera_pos = self.splatting_args.camera.position;
+                let old_camera_rot = self.splatting_args.camera.rotation;
+                
+                // Then in a single atomic operation, replace everything
+                self.renderer = new_renderer;
+                self.pc = new_pc;
+                self.pointcloud_file_path = Some(loading_state.file_path.clone());
+                
+                // Adjust camera to view the new point cloud
+                let aabb = self.pc.bbox();
+                self.splatting_args.camera.fit_near_far(aabb);
+                
+                // Keep camera oriented in the same way
+                self.controller.center = self.pc.center();
+                
+                // Keep looking at approximately the same view direction
+                self.splatting_args.camera.position = old_camera_pos;
+                self.splatting_args.camera.rotation = old_camera_rot;
+                
+                // Now clear the loading state to indicate completion
+                self.loading_state = None;
+                
+                // Force an immediate redraw with the new point cloud
+                // This will happen in the next frame, ensuring no lag is visible
+                self.window.request_redraw();
+                log::info!("New point cloud applied successfully");
             } else {
-                 log::warn!("Renderer result found, but loading state was already cleared?");
+                log::warn!("Renderer and PointCloud results found, but loading state was already cleared.");
             }
         }
 
@@ -512,9 +531,19 @@ impl WindowContext {
             false
         };
 
-        // Always request redraw if loading is ongoing to update progress/handle completion
+        // Always request redraw while loading is in progress
+        // This keeps the UI responsive and continues to display the current scene
         if self.loading_state.is_some() || loading_needs_redraw {
             self.window.request_redraw();
+            
+            // Add a small yield to allow the UI to render between loading steps
+            #[cfg(target_arch = "wasm32")]
+            {
+                // Use a synchronous timeout to yield to the browser without awaiting
+                gloo_timers::callback::Timeout::new(5, || {
+                    // Empty callback, just letting browser do some work
+                }).forget();
+            }
         }
         
         Ok(())
@@ -525,7 +554,10 @@ impl WindowContext {
         redraw_scene: bool,
         shapes: Option<FullOutput>,
     ) -> Result<(), wgpu::SurfaceError> {
-        self.stopwatch.as_mut().map(|s| s.reset());
+        // Skip performance measurement during loading to avoid overhead
+        if !self.loading_state.is_some() {
+            self.stopwatch.as_mut().map(|s| s.reset());
+        }
 
         let output = self.surface.get_current_texture()?;
         let view_rgb = output.texture.create_view(&wgpu::TextureViewDescriptor {
@@ -533,7 +565,6 @@ impl WindowContext {
             ..Default::default()
         });
         let view_srgb = output.texture.create_view(&Default::default());
-        // do prepare stuff
 
         let mut encoder =
             self.wgpu_context
@@ -542,17 +573,35 @@ impl WindowContext {
                     label: Some("render command encoder"),
                 });
 
-        if redraw_scene {
-            self.renderer.prepare(
-                &mut encoder,
-                &self.wgpu_context.device,
-                &self.wgpu_context.queue,
-                &self.pc,
-                self.splatting_args,
-                (&mut self.stopwatch).into(),
-            );
+        // Always render the scene when loading to maintain visual continuity
+        let is_loading = self.loading_state.is_some();
+        
+        if redraw_scene || is_loading {
+            // During loading, use a simplified rendering path with fewer features
+            // This ensures maximum frame rate during the critical loading period
+            if is_loading {
+                self.renderer.prepare(
+                    &mut encoder,
+                    &self.wgpu_context.device,
+                    &self.wgpu_context.queue,
+                    &self.pc,
+                    self.splatting_args,
+                    &mut None, // Skip stopwatch during loading
+                );
+            } else {
+                // Normal path with all features when not loading
+                self.renderer.prepare(
+                    &mut encoder,
+                    &self.wgpu_context.device,
+                    &self.wgpu_context.queue,
+                    &self.pc,
+                    self.splatting_args,
+                    (&mut self.stopwatch).into(),
+                );
+            }
         }
 
+        // Prepare UI state (always do this to maintain responsiveness)
         let ui_state = shapes.map(|shapes| {
             self.ui_renderer.prepare(
                 PhysicalSize {
@@ -567,10 +616,13 @@ impl WindowContext {
             )
         });
 
-        if let Some(stopwatch) = &mut self.stopwatch {
-            stopwatch.start(&mut encoder, "rasterization").unwrap();
+        // Skip performance measurement during loading
+        if !is_loading && self.stopwatch.is_some() {
+            self.stopwatch.as_mut().unwrap().start(&mut encoder, "rasterization").unwrap();
         }
-        if redraw_scene {
+        
+        // Always render during loading, otherwise only when requested
+        if redraw_scene || is_loading {
             let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("render pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -585,10 +637,13 @@ impl WindowContext {
             });
             self.renderer.render(&mut render_pass, &self.pc);
         }
-        if let Some(stopwatch) = &mut self.stopwatch {
-            stopwatch.stop(&mut encoder, "rasterization").unwrap();
+        
+        // Skip performance measurement during loading
+        if !is_loading && self.stopwatch.is_some() {
+            self.stopwatch.as_mut().unwrap().stop(&mut encoder, "rasterization").unwrap();
         }
 
+        // Always render the display to keep the UI responsive
         self.display.render(
             &mut encoder,
             &view_rgb,
@@ -596,8 +651,13 @@ impl WindowContext {
             self.renderer.camera(),
             &self.renderer.render_settings(),
         );
-        self.stopwatch.as_mut().map(|s| s.end(&mut encoder));
+        
+        // Skip performance measurement during loading
+        if !is_loading {
+            self.stopwatch.as_mut().map(|s| s.end(&mut encoder));
+        }
 
+        // Always render the UI to keep it responsive
         if let Some(state) = &ui_state {
             let mut render_pass = encoder
                 .begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -616,11 +676,31 @@ impl WindowContext {
             self.ui_renderer.render(&mut render_pass, state);
         }
 
-
         if let Some(ui_state) = ui_state {
             self.ui_renderer.cleanup(ui_state)
         }
-        self.wgpu_context.queue.submit([encoder.finish()]);
+        
+        // Submit render commands (use lower priority during loading)
+        if is_loading {
+            #[cfg(target_arch = "wasm32")]
+            {
+                // On web, use a callback timeout before submitting to ensure UI remains smooth
+                let queue = self.wgpu_context.queue.clone();
+                let encoder_finished = encoder.finish();
+                
+                gloo_timers::callback::Timeout::new(1, move || {
+                    queue.submit(Some(encoder_finished));
+                }).forget();
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                // On native, just submit normally
+                self.wgpu_context.queue.submit(Some(encoder.finish()));
+            }
+        } else {
+            // Normal submission path
+            self.wgpu_context.queue.submit(Some(encoder.finish()));
+        }
 
         output.present();
         self.splatting_args.resolution = Vector2::new(self.config.width, self.config.height);
@@ -799,9 +879,35 @@ impl WindowContext {
         if let Some(loading_state) = &mut self.loading_state {
             // Native Path: Handle file reading and renderer creation (can block)
             if let Some(pc_raw) = loading_state.pc_raw.take() {
-                log::info!("Applying new point cloud with {} points", pc_raw.num_points);
-                let new_pc = PointCloud::new(&self.wgpu_context.device, pc_raw)?;
-                self.renderer = pollster::block_on(
+                log::info!("Creating new point cloud with {} points", pc_raw.num_points);
+                
+                // Create new point cloud
+                match PointCloud::new(&self.wgpu_context.device, pc_raw) {
+                    Ok(new_pc) => {
+                        // Store in pending_pc for safe keeping until we're ready to swap
+                        loading_state.pending_pc = Some(new_pc);
+                        loading_state.progress = 0.9; // Almost done
+                    },
+                    Err(e) => {
+                        log::error!("Failed to create point cloud: {:?}", e);
+                        self.loading_state = None;
+                        return Err(e);
+                    }
+                }
+            } else if let Some(new_pc) = loading_state.pending_pc.take() {
+                // We have a new point cloud but need to create renderer
+                log::info!("Creating new renderer for point cloud with {} points", new_pc.num_points());
+                
+                // Request redraw of the current scene before we start creating the renderer
+                // This ensures we don't block the render thread
+                self.window.request_redraw();
+                
+                // Make a backup of the current camera parameters
+                let old_camera_pos = self.splatting_args.camera.position;
+                let old_camera_rot = self.splatting_args.camera.rotation;
+                
+                // Create new renderer in a safer way
+                match pollster::block_on(
                     GaussianRenderer::new(
                         &self.wgpu_context.device,
                         &self.wgpu_context.queue,
@@ -809,23 +915,42 @@ impl WindowContext {
                         new_pc.sh_deg(),
                         new_pc.compressed()
                     )
-                );
-                self.pc = new_pc;
-                self.pointcloud_file_path = Some(loading_state.file_path.clone());
-                self.loading_state = None;
-                let aabb = self.pc.bbox();
-                self.splatting_args.camera.fit_near_far(aabb);
-                self.controller.center = self.pc.center();
-                log::info!("New point cloud loaded successfully");
-                self.window.request_redraw();
-            } else {
-                if loading_state.progress >= 1.0 {
+                ) {
+                    new_renderer => {
+                        // Now swap everything in one atomic operation
+                        self.renderer = new_renderer;
+                        self.pc = new_pc;
+                        self.pointcloud_file_path = Some(loading_state.file_path.clone());
+                        
+                        // Adjust camera to view the new point cloud
+                        let aabb = self.pc.bbox();
+                        self.splatting_args.camera.fit_near_far(aabb);
+                        self.controller.center = self.pc.center();
+                        
+                        // Preserve camera orientation
+                        self.splatting_args.camera.position = old_camera_pos;
+                        self.splatting_args.camera.rotation = old_camera_rot;
+                        
+                        // Clear loading state
+                        self.loading_state = None;
+                        
+                        // Request a redraw with the new point cloud
+                        self.window.request_redraw();
+                        log::info!("New point cloud loaded successfully");
+                    }
+                }
+            } else if loading_state.progress < 1.0 {
+                // No pc_raw or pending_pc, so we need to load the file
+                if loading_state.progress >= 0.9 {
+                    // If we're almost done, actually load the file
                     let file_path = loading_state.file_path.clone();
                     match std::fs::File::open(&file_path) {
                         Ok(file) => {
                             match io::GenericGaussianPointCloud::load(file) {
                                 Ok(pc_raw) => {
+                                    log::info!("Loaded point cloud data from {:?}", file_path);
                                     loading_state.pc_raw = Some(pc_raw);
+                                    loading_state.progress = 1.0;
                                 },
                                 Err(e) => {
                                     log::error!("Failed to load point cloud: {:?}", e);
@@ -841,6 +966,7 @@ impl WindowContext {
                         }
                     }
                 } else {
+                    // Simulate progress until we're ready to load
                     loading_state.progress += 0.1;
                 }
             }
@@ -856,58 +982,114 @@ impl WindowContext {
         if let Some(loading_state) = &mut self.loading_state {
             // Check if pc_raw is ready from parsing in update()
             if let Some(pc_raw) = loading_state.pc_raw.take() {
-                log::info!("WASM: Parsed data ready, creating PointCloud...");
-                match PointCloud::new(&self.wgpu_context.device, pc_raw) {
-                    Ok(new_pc) => {
-                        log::info!("WASM: PointCloud created ({} points), spawning renderer creation...", new_pc.num_points());
-                        loading_state.pending_pc = Some(new_pc); // Store PC
-
-                        // Clone necessary data for the async task
-                        let device = self.wgpu_context.device.clone();
-                        let queue = self.wgpu_context.queue.clone();
-                        let color_format = self.renderer.color_format();
-                        let shared_state_clone = self.shared_state.clone();
-                        let sh_deg = loading_state.pending_pc.as_ref().unwrap().sh_deg();
-                        let compressed = loading_state.pending_pc.as_ref().unwrap().compressed();
-
-                        // Spawn the async task
-                        spawn_local(async move {
-                            log::info!("WASM: Async task started: Creating GaussianRenderer...");
-                            let renderer = GaussianRenderer::new(
-                                &device,
-                                &queue,
-                                color_format,
-                                sh_deg,
-                                compressed
-                            ).await;
-                            log::info!("WASM: Async task finished: Renderer created.");
-                            // Put the result in shared state
-                            let mut renderer_guard = shared_state_clone.new_renderer_result.lock().unwrap();
-                            *renderer_guard = Some(renderer);
-                        });
-                    },
-                    Err(e) => {
-                        log::error!("WASM: Failed to create PointCloud: {:?}", e);
-                        self.loading_state = None; // Abort loading
-                        return Err(e);
+                log::info!("WASM: Parsed data ready, creating PointCloud asynchronously...");
+                
+                // Clone necessary data for the async task
+                let device = self.wgpu_context.device.clone();
+                let queue = self.wgpu_context.queue.clone();
+                let color_format = self.renderer.color_format();
+                let shared_state_clone = self.shared_state.clone();
+                let splatting_args = self.splatting_args.clone();
+                
+                // Move pc_raw into async task and perform full loading in background
+                spawn_local(async move {
+                    log::info!("WASM: Async task started: Creating PointCloud...");
+                    
+                    // Allow UI to update before starting intensive work
+                    gloo_timers::callback::Timeout::new(10, || {}).forget();
+                    
+                    // Create PointCloud in a separate task to avoid blocking the UI
+                    let new_pc = match PointCloud::new(&device, pc_raw) {
+                        Ok(pc) => {
+                            log::info!("WASM: PointCloud created successfully ({} points)", pc.num_points());
+                            pc
+                        },
+                        Err(e) => {
+                            log::error!("WASM: Failed to create PointCloud: {:?}", e);
+                            return; // Exit the async task
+                        }
+                    };
+                    
+                    // Yield back to the browser multiple times to ensure UI responsiveness
+                    // This splits the work into smaller chunks
+                    gloo_timers::callback::Timeout::new(20, || {}).forget();
+                    
+                    let sh_deg = new_pc.sh_deg();
+                    let compressed = new_pc.compressed();
+                    
+                    log::info!("WASM: Creating GaussianRenderer...");
+                    
+                    // Pre-create resources before awaiting
+                    let renderer_future = GaussianRenderer::new(
+                        &device,
+                        &queue,
+                        color_format,
+                        sh_deg,
+                        compressed
+                    );
+                    
+                    // Let browser process events
+                    gloo_timers::callback::Timeout::new(20, || {}).forget();
+                    
+                    // Create the renderer
+                    let mut renderer = renderer_future.await;
+                    
+                    // Critical step: Pre-initialize the renderer with the new point cloud
+                    // This ensures the first frame with the new point cloud is fully prepared
+                    log::info!("WASM: Pre-initializing renderer for first frame...");
+                    
+                    // Create a command encoder for initialization
+                    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                        label: Some("Pre-initialization command encoder"),
+                    });
+                    
+                    // Prepare the renderer with the new point cloud (this avoids the lag on first use)
+                    renderer.prepare(
+                        &mut encoder,
+                        &device,
+                        &queue,
+                        &new_pc,
+                        splatting_args.clone(),
+                        &mut None
+                    );
+                    
+                    // Submit the initialization commands to the GPU
+                    queue.submit(Some(encoder.finish()));
+                    
+                    // Let browser process events one more time
+                    gloo_timers::callback::Timeout::new(10, || {}).forget();
+                    
+                    log::info!("WASM: Async task complete: PointCloud and Renderer fully initialized and ready.");
+                    
+                    // Put both results in shared state, only when completely ready
+                    let mut renderer_guard = shared_state_clone.new_renderer_result.lock().unwrap();
+                    *renderer_guard = Some((renderer, new_pc));
+                });
+                
+                // Set progress to indicate an active background operation
+                loading_state.progress = 0.5;
+                loading_state.start_time = Instant::now(); // Reset timer for progress estimation
+            } else if loading_state.progress < 1.0 {
+                // Calculate elapsed time for better progress estimation
+                let elapsed = Instant::now().duration_since(loading_state.start_time);
+                let elapsed_secs = elapsed.as_secs_f32();
+                
+                // Create a more realistic progress indicator based on time
+                if loading_state.progress < 0.95 {
+                    if elapsed_secs < 2.0 {
+                        // First phase: Creating point cloud (up to 70%)
+                        loading_state.progress = (0.5 + (elapsed_secs / 2.0) * 0.2).min(0.7); 
+                    } else if elapsed_secs < 4.0 {
+                        // Second phase: Creating renderer (up to 90%)
+                        loading_state.progress = (0.7 + ((elapsed_secs - 2.0) / 2.0) * 0.2).min(0.9);
+                    } else {
+                        // Final phase: Pre-rendering & initialization (up to 95%)
+                        loading_state.progress = (0.9 + ((elapsed_secs - 4.0) / 2.0) * 0.05).min(0.95);
                     }
                 }
-            } else if loading_state.pending_pc.is_none() {
-                 // If we don't have raw data and no PC is pending, simulate progress (or handle errors)
-                 if loading_state.progress < 1.0 {
-                    loading_state.progress += 0.1;
-                    log::debug!("WASM loading progress: {}", loading_state.progress);
-                 } else {
-                    // Progress was 1.0, but pc_raw wasn't taken and pending_pc is None.
-                    // This indicates parsing might have failed in update().
-                    log::warn!("WASM update_loading: progress >= 1.0 but no pc_raw or pending_pc. Check parsing logs.");
-                    // Optionally clear loading state here
-                    // self.loading_state = None;
-                 }
-            } else {
-                // We have a pending_pc, just waiting for the renderer task to finish.
-                // Do nothing here, wait for the check in update().
-                log::debug!("WASM update_loading: Waiting for renderer creation task...");
+                
+                // Keep rendering while loading
+                self.window.request_redraw();
             }
         }
         Ok(())
@@ -1176,24 +1358,35 @@ pub async fn open_window<R: Read + Seek + Send + Sync + 'static>(
                 // Check if any state has changed that requires a redraw
                 let request_redraw = old_settings != state.splatting_args 
                     || resolution_change 
-                    || old_loading_state != new_loading_state;
+                    || old_loading_state != new_loading_state
+                    || state.loading_state.is_some(); // Always redraw while loading
     
-                if request_redraw || redraw_ui{
-                    state.fps = (1. / dt.as_secs_f32()) * 0.05 + state.fps * 0.95;
-                    match state.render(request_redraw,state.ui_visible.then_some(shapes)) {
+                if request_redraw || redraw_ui {
+                    // During loading, prioritize smooth UI updates by not calculating FPS
+                    // which can cause stuttering due to smoothing calculations
+                    if !state.loading_state.is_some() {
+                        state.fps = (1. / dt.as_secs_f32()) * 0.05 + state.fps * 0.95;
+                    }
+                    
+                    match state.render(request_redraw, state.ui_visible.then_some(shapes)) {
                         Ok(_) => {}
                         // Reconfigure the surface if lost
                         Err(wgpu::SurfaceError::Lost) => state.resize(state.window.inner_size(), None),
                         // The system is out of memory, we should probably quit
-                        Err(wgpu::SurfaceError::OutOfMemory) =>target.exit(),
+                        Err(wgpu::SurfaceError::OutOfMemory) => target.exit(),
                         // All other errors (Outdated, Timeout) should be resolved by the next frame
                         Err(e) => println!("error: {:?}", e),
                     }
                 }
                 
-                // Always request a redraw when loading a file to keep progress bar updating
+                // Always request a redraw when loading a file to keep progress bar updating and scene rendering
                 if state.loading_state.is_some() || config.no_vsync {
                     state.window.request_redraw();
+                    
+                    // Set polling mode during loading for maximum responsiveness
+                    if state.loading_state.is_some() {
+                        target.set_control_flow(ControlFlow::Poll);
+                    }
                 }
             }
             _ => {}
@@ -1205,7 +1398,7 @@ pub async fn open_window<R: Read + Seek + Send + Sync + 'static>(
             state.controller.process_mouse(delta.0 as f32, delta.1 as f32)
         }
         _ => {},
-    }).unwrap();
+    });
 }
 
 #[cfg(target_arch = "wasm32")]

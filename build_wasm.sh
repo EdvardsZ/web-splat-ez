@@ -1,4 +1,4 @@
-export RUSTFLAGS='--cfg getrandom_backend="wasm_js"'
+export RUSTFLAGS='--cfg getrandom_backend="wasm_js" -C target-feature=+simd128'
 cargo build \
     --no-default-features \
     --target wasm32-unknown-unknown \
@@ -8,4 +8,4 @@ cargo build \
 && wasm-bindgen \
     --out-dir public \
     --web target/wasm32-unknown-unknown/web-release/web_splats.wasm \
-    --no-typescript     
+    --no-typescript 

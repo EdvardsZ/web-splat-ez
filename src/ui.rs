@@ -22,7 +22,45 @@ use egui::{emath::Numeric, Color32, RichText};
 #[cfg(not(target_arch = "wasm32"))]
 use egui_plot::{Legend, PlotPoints};
 
-// Helper function to render the loading state
+// Helper function to render the loading state for WASM
+#[cfg(target_arch = "wasm32")]
+fn render_loading_ui(ui: &mut egui::Ui, loading_info: (bool, f32, Option<String>)) {
+    let (is_loading, progress, filename) = loading_info;
+    
+    if is_loading {
+        ui.end_row();
+        ui.strong("Loading:");
+        ui.horizontal(|ui| {
+            // Add a fancy animated progress bar
+            ui.add(egui::ProgressBar::new(progress)
+                .show_percentage()
+                .animate(true)
+                .desired_width(150.0)
+            );
+            
+            // Show stage of loading based on progress value
+            let stage_text = if progress < 0.5 {
+                "Parsing data..."
+            } else if progress < 0.85 {
+                "Creating 3D gaussians..."
+            } else if progress < 0.95 {
+                "Preparing renderer..."
+            } else {
+                "Finalizing..."
+            };
+            
+            ui.vertical(|ui| {
+                if let Some(name) = filename {
+                    ui.label(name);
+                }
+                ui.label(stage_text);
+            });
+        });
+        ui.end_row();
+    }
+}
+
+// Helper function to render the loading state for non-WASM
 #[cfg(not(target_arch = "wasm32"))]
 fn render_loading_ui(ui: &mut egui::Ui, loading_info: (bool, f32, Option<String>)) {
     let (is_loading, progress, filename) = loading_info;
@@ -249,7 +287,7 @@ pub(crate) fn ui(state: &mut WindowContext) -> bool {
                         ui.end_row();
                     }
                     
-                    // Show loading status and instructions
+                    // Show loading status and instructions for non-WASM
                     #[cfg(not(target_arch = "wasm32"))]
                     if let Some(loading_state) = &state.loading_state {
                         ui.end_row();
@@ -265,6 +303,13 @@ pub(crate) fn ui(state: &mut WindowContext) -> bool {
                             }
                         });
                         ui.end_row();
+                    }
+                    
+                    // Show loading status for WASM
+                    #[cfg(target_arch = "wasm32")]
+                    if let Some(loading_state) = &state.loading_state {
+                        let filename = loading_state.file_path.file_name().map(|name| name.to_string_lossy().to_string());
+                        render_loading_ui(ui, (true, loading_state.progress, filename));
                     }
                     
                     // Add key instructions
