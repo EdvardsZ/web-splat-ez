@@ -33,7 +33,7 @@ fn render_loading_ui(ui: &mut egui::Ui, loading_info: (bool, f32, Option<String>
     );
     
     if button.clicked() {
-        if let Some(path) = rfd::FileDialog::new()
+        if let Some(_path) = rfd::FileDialog::new()
             .add_filter("PLY Files", &["ply"])
             .pick_file() 
         {

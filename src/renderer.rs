@@ -177,7 +177,7 @@ impl GaussianRenderer {
                 &self.draw_indirect_buffer.slice(..),
                 move |b| {
                     let download = b.unwrap();
-                    let data = download.as_ref();
+                    let data: &[u8] = download.as_ref();
                     let num_points = u32::from_le_bytes([data[4], data[5], data[6], data[7]]);
                     tx.send(num_points).unwrap();
                 },

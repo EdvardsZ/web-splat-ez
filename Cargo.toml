@@ -25,7 +25,7 @@ num-traits = "0.2.19"
 half = { version = "2.6.0", features = ["bytemuck", "num-traits"] }
 log = "0.4.27"
 rayon = "1.9.0"
-image = "0.25.6"
+image = { version = "0.25", default-features = false, features = ["hdr", "png"] }
 indicatif = "0.17.11"
 
 
@@ -41,6 +41,8 @@ futures-intrusive = "0.5.0"
 splines = { features = [
     "cgmath",
 ], git = "https://github.com/KeKsBoTer/splines" }
+
+cfg-if = "1.0"
 
 [dev-dependencies]
 wasm-bindgen-cli = "0.2.92"
@@ -62,9 +64,10 @@ video = []
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 pollster = { version = "0.4.0", features = ["macro"] }
-rfd = "0.14.0"
+rfd = "0.15.3"
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
+rfd = "0.15.3"
 
 getrandom = { version = "0.3.2", features = ["wasm_js"] }
 wasm-bindgen = "0.2.100"

@@ -3,6 +3,7 @@ use std::{
     path::{Path, PathBuf},
     sync::Arc,
 };
+use std::sync::Mutex;
 
 use image::Pixel;
 #[cfg(target_arch = "wasm32")]
@@ -30,6 +31,11 @@ use winit::{
     window::Window,
 };
 
+#[cfg(not(target_arch = "wasm32"))]
+use rfd::FileDialog;
+#[cfg(target_arch = "wasm32")]
+use rfd::AsyncFileDialog;
+
 mod animation;
 mod ui;
 pub use animation::{Animation, Sampler, TrackingShot, Transition};
@@ -54,6 +60,8 @@ pub mod gpu_rs;
 mod ui_renderer;
 mod uniform;
 mod utils;
+
+use cfg_if::cfg_if;
 
 pub struct RenderConfig {
     pub no_vsync: bool,
@@ -157,6 +165,9 @@ pub struct WindowContext {
     cameras_save_path: String,
     stopwatch: Option<GPUStopwatch>,
     
+    // Shared state for async operations like file loading
+    shared_state: Arc<SharedState>,
+
     // File loading state
     loading_state: Option<LoadingState>,
 }
@@ -167,6 +178,13 @@ pub struct LoadingState {
     pub progress: f32, // 0.0 to 1.0
     pub start_time: Instant,
     pub pc_raw: Option<io::GenericGaussianPointCloud>,
+    pub pending_pc: Option<PointCloud>, // Hold parsed PC while renderer is created
+}
+
+// Shared state for communicating async results back to the main thread
+struct SharedState {
+    file_load_request: Mutex<Option<(Vec<u8>, String)>>, // (file_data, file_name)
+    new_renderer_result: Mutex<Option<GaussianRenderer>>,
 }
 
 impl WindowContext {
@@ -308,6 +326,12 @@ impl WindowContext {
 
             stopwatch,
             
+            // Shared state for async operations like file loading
+            shared_state: Arc::new(SharedState {
+                file_load_request: Mutex::new(None),
+                new_renderer_result: Mutex::new(None),
+            }),
+
             // File loading state
             loading_state: None,
         })
@@ -416,20 +440,80 @@ impl WindowContext {
         let aabb = self.pc.bbox();
         self.splatting_args.camera.fit_near_far(aabb);
         
+        // Check if async renderer creation has finished (WASM)
+        if let Some(new_renderer) = self.shared_state.new_renderer_result.lock().unwrap().take() {
+            if let Some(loading_state) = &mut self.loading_state {
+                if let Some(new_pc) = loading_state.pending_pc.take() {
+                    log::info!("Applying newly created renderer and point cloud.");
+                    self.renderer = new_renderer;
+                    self.pc = new_pc;
+                    self.pointcloud_file_path = Some(loading_state.file_path.clone());
+                    
+                    // Adjust camera to view the new point cloud
+                    let aabb = self.pc.bbox();
+                    self.splatting_args.camera.fit_near_far(aabb);
+                    self.controller.center = self.pc.center();
+
+                    self.loading_state = None; // Finished loading
+                    self.window.request_redraw(); // Ensure redraw
+                    log::info!("New point cloud applied successfully.");
+                } else {
+                    log::error!("Renderer result found, but no pending point cloud in loading state!");
+                    self.loading_state = None; // Clear broken state
+                }
+            } else {
+                 log::warn!("Renderer result found, but loading state was already cleared?");
+            }
+        }
+
+        // Check for pending file load requests (primarily from wasm async dialog)
+        let file_request = self.shared_state.file_load_request.lock().unwrap().take();
+        if let Some((data, name)) = file_request {
+            if self.loading_state.is_none() {
+                // Start loading from data
+                log::info!("Starting to load new point cloud from uploaded file: {}", name);
+                self.loading_state = Some(LoadingState {
+                    file_path: PathBuf::from(&name), // Store filename as path for consistency (it's PathBuf)
+                    progress: 0.0, // Start progress simulation
+                    start_time: Instant::now(),
+                    pc_raw: None,
+                    pending_pc: None,
+                });
+                // Directly try parsing pc_raw here, will be applied in update_loading
+                match io::GenericGaussianPointCloud::load(std::io::Cursor::new(data)) {
+                    Ok(pc_raw) => {
+                         if let Some(ls) = &mut self.loading_state {
+                             log::info!("Successfully parsed point cloud data for {}", name);
+                             ls.pc_raw = Some(pc_raw);
+                             ls.progress = 1.0; // Mark as ready to be applied immediately
+                         }
+                    },
+                    Err(e) => {
+                        log::error!("Failed to parse point cloud from uploaded data: {:?}", e);
+                        self.loading_state = None; // Abort loading
+                    }
+                }
+            } else {
+                log::warn!("Ignoring file load request while another load is in progress.");
+            }
+        }
+
         // Update file loading if in progress
-        #[cfg(not(target_arch = "wasm32"))]
         let loading_needs_redraw = if self.loading_state.is_some() {
-            self.update_loading()?;
-            true // Loading is in progress, request redraw to update UI
+            if let Err(e) = self.update_loading() {
+                log::error!("Error during update_loading: {:?}", e);
+                // Optionally clear loading state on error
+                self.loading_state = None;
+                false // Don't signal redraw if update_loading failed catastrophically
+            } else {
+                true // Loading is in progress (or just finished this cycle)
+            }
         } else {
             false
         };
-        
-        #[cfg(target_arch = "wasm32")]
-        let loading_needs_redraw = false;
-        
-        // Immediately request a redraw if loading is in progress
-        if loading_needs_redraw {
+
+        // Always request redraw if loading is ongoing to update progress/handle completion
+        if self.loading_state.is_some() || loading_needs_redraw {
             self.window.request_redraw();
         }
         
@@ -691,7 +775,8 @@ impl WindowContext {
         
         // Don't start loading if already loading or if it's the same file
         if let Some(state) = &self.loading_state {
-            if state.file_path == path {
+            if state.file_path == path { // Compare PathBuf with PathBuf
+                log::warn!("Attempted to load the same file again: {:?}", path);
                 return Ok(());
             }
         }
@@ -702,6 +787,7 @@ impl WindowContext {
             progress: 0.0,
             start_time: Instant::now(),
             pc_raw: None,
+            pending_pc: None,
         });
         
         Ok(())
@@ -711,14 +797,10 @@ impl WindowContext {
     #[cfg(not(target_arch = "wasm32"))]
     fn update_loading(&mut self) -> anyhow::Result<()> {
         if let Some(loading_state) = &mut self.loading_state {
-            // If loading is complete, apply the new point cloud
+            // Native Path: Handle file reading and renderer creation (can block)
             if let Some(pc_raw) = loading_state.pc_raw.take() {
                 log::info!("Applying new point cloud with {} points", pc_raw.num_points);
-                
-                // Create new point cloud
                 let new_pc = PointCloud::new(&self.wgpu_context.device, pc_raw)?;
-                
-                // Update the renderer
                 self.renderer = pollster::block_on(
                     GaussianRenderer::new(
                         &self.wgpu_context.device,
@@ -728,27 +810,17 @@ impl WindowContext {
                         new_pc.compressed()
                     )
                 );
-                
-                // Update the point cloud
                 self.pc = new_pc;
                 self.pointcloud_file_path = Some(loading_state.file_path.clone());
-                
-                // Reset the loading state
                 self.loading_state = None;
-                
-                // Adjust camera to view the new point cloud
                 let aabb = self.pc.bbox();
                 self.splatting_args.camera.fit_near_far(aabb);
                 self.controller.center = self.pc.center();
-                
                 log::info!("New point cloud loaded successfully");
+                self.window.request_redraw();
             } else {
-                // If we're still in a loading state but don't have the raw data yet, let's do the loading
                 if loading_state.progress >= 1.0 {
-                    // Once progress reaches 100%, start actual loading
                     let file_path = loading_state.file_path.clone();
-                    
-                    // Load the file
                     match std::fs::File::open(&file_path) {
                         Ok(file) => {
                             match io::GenericGaussianPointCloud::load(file) {
@@ -769,13 +841,75 @@ impl WindowContext {
                         }
                     }
                 } else {
-                    // Just simulate progress for demo purposes
-                    // In a real implementation, you would track actual loading progress here
-                    loading_state.progress += 0.01;
+                    loading_state.progress += 0.1;
                 }
             }
         }
-        
+        Ok(())
+    }
+
+    // WASM version of update_loading: Spawns async renderer creation
+    #[cfg(target_arch = "wasm32")]
+    fn update_loading(&mut self) -> anyhow::Result<()> {
+        use wasm_bindgen_futures::spawn_local;
+
+        if let Some(loading_state) = &mut self.loading_state {
+            // Check if pc_raw is ready from parsing in update()
+            if let Some(pc_raw) = loading_state.pc_raw.take() {
+                log::info!("WASM: Parsed data ready, creating PointCloud...");
+                match PointCloud::new(&self.wgpu_context.device, pc_raw) {
+                    Ok(new_pc) => {
+                        log::info!("WASM: PointCloud created ({} points), spawning renderer creation...", new_pc.num_points());
+                        loading_state.pending_pc = Some(new_pc); // Store PC
+
+                        // Clone necessary data for the async task
+                        let device = self.wgpu_context.device.clone();
+                        let queue = self.wgpu_context.queue.clone();
+                        let color_format = self.renderer.color_format();
+                        let shared_state_clone = self.shared_state.clone();
+                        let sh_deg = loading_state.pending_pc.as_ref().unwrap().sh_deg();
+                        let compressed = loading_state.pending_pc.as_ref().unwrap().compressed();
+
+                        // Spawn the async task
+                        spawn_local(async move {
+                            log::info!("WASM: Async task started: Creating GaussianRenderer...");
+                            let renderer = GaussianRenderer::new(
+                                &device,
+                                &queue,
+                                color_format,
+                                sh_deg,
+                                compressed
+                            ).await;
+                            log::info!("WASM: Async task finished: Renderer created.");
+                            // Put the result in shared state
+                            let mut renderer_guard = shared_state_clone.new_renderer_result.lock().unwrap();
+                            *renderer_guard = Some(renderer);
+                        });
+                    },
+                    Err(e) => {
+                        log::error!("WASM: Failed to create PointCloud: {:?}", e);
+                        self.loading_state = None; // Abort loading
+                        return Err(e);
+                    }
+                }
+            } else if loading_state.pending_pc.is_none() {
+                 // If we don't have raw data and no PC is pending, simulate progress (or handle errors)
+                 if loading_state.progress < 1.0 {
+                    loading_state.progress += 0.1;
+                    log::debug!("WASM loading progress: {}", loading_state.progress);
+                 } else {
+                    // Progress was 1.0, but pc_raw wasn't taken and pending_pc is None.
+                    // This indicates parsing might have failed in update().
+                    log::warn!("WASM update_loading: progress >= 1.0 but no pc_raw or pending_pc. Check parsing logs.");
+                    // Optionally clear loading state here
+                    // self.loading_state = None;
+                 }
+            } else {
+                // We have a pending_pc, just waiting for the renderer task to finish.
+                // Do nothing here, wait for the check in update().
+                log::debug!("WASM update_loading: Waiting for renderer creation task...");
+            }
+        }
         Ok(())
     }
 }
@@ -931,16 +1065,45 @@ pub async fn open_window<R: Read + Seek + Send + Sync + 'static>(
                         state.save_view();
                     } else if key == KeyCode::KeyO {
                         // Add a keyboard shortcut for opening a PLY file
-                        #[cfg(not(target_arch = "wasm32"))]
-                        {
-                            if state.loading_state.is_none() {
-                                if let Some(path) = rfd::FileDialog::new()
-                                    .add_filter("PLY Files", &["ply"])
-                                    .pick_file() 
-                                {
-                                    if let Err(err) = state.load_new_file(&path) {
-                                        log::error!("failed to load file: {:?}", err);
+                        cfg_if! {
+                            if #[cfg(target_arch = "wasm32")] {
+                                use wasm_bindgen_futures::spawn_local;
+                                if state.loading_state.is_none() {
+                                    log::info!("Opening file dialog...");
+                                    let shared_state_clone = state.shared_state.clone();
+                                    spawn_local(async move {
+                                        if let Some(file_handle) = AsyncFileDialog::new()
+                                            .add_filter("PLY Files", &["ply"])
+                                            .pick_file()
+                                            .await
+                                        {
+                                            log::info!("File selected, reading data...");
+                                            let data = file_handle.read().await;
+                                            let name = file_handle.file_name();
+                                            log::info!("Read {} bytes from {}", data.len(), name);
+                                            let mut request = shared_state_clone.file_load_request.lock().unwrap();
+                                            *request = Some((data, name));
+                                            // Request redraw implicitly handled by checking state in update loop
+                                        } else {
+                                            log::info!("File selection cancelled.");
+                                        }
+                                    });
+                                } else {
+                                    log::warn!("Already loading a file, cannot open another.");
+                                }
+                            } else {
+                                // Native platform: use synchronous dialog
+                                if state.loading_state.is_none() {
+                                    if let Some(path) = FileDialog::new()
+                                        .add_filter("PLY Files", &["ply"])
+                                        .pick_file()
+                                    {
+                                        if let Err(err) = state.load_new_file(&path) {
+                                            log::error!("failed to load file: {:?}", err);
+                                        }
                                     }
+                                } else {
+                                    log::warn!("Already loading a file, cannot open another.");
                                 }
                             }
                         }
