@@ -16,6 +16,7 @@ use wgpu::{util::DeviceExt, Backends, Extent3d};
 use cgmath::{Deg, EuclideanSpace, Point3, Quaternion, UlpsEq, Vector2, Vector3};
 use egui::FullOutput;
 use num_traits::One;
+use flume;
 
 use utils::key_to_num;
 #[cfg(not(target_arch = "wasm32"))]
@@ -188,7 +189,12 @@ pub struct LoadingState {
 // Shared state for communicating async results back to the main thread
 struct SharedState {
     file_load_request: Mutex<Option<(Vec<u8>, String)>>, // (file_data, file_name)
-    new_renderer_result: Mutex<Option<(GaussianRenderer, PointCloud)>>, // Now holds both renderer and point cloud
+    new_renderer_result: Mutex<Option<(GaussianRenderer, PointCloud)>>, // Holds both renderer and point cloud
+    skybox_texture: Mutex<Option<wgpu::Texture>>, // For async skybox loading
+    
+    // Flume channels for async file loading
+    pc_raw_sender: flume::Sender<(io::GenericGaussianPointCloud, PathBuf)>,
+    pc_raw_receiver: flume::Receiver<(io::GenericGaussianPointCloud, PathBuf)>,
 }
 
 impl WindowContext {
@@ -331,9 +337,15 @@ impl WindowContext {
             stopwatch,
             
             // Shared state for async operations like file loading
-            shared_state: Arc::new(SharedState {
-                file_load_request: Mutex::new(None),
-                new_renderer_result: Mutex::new(None),
+            shared_state: Arc::new({
+                let (pc_raw_sender, pc_raw_receiver) = flume::unbounded();
+                SharedState {
+                    file_load_request: Mutex::new(None),
+                    new_renderer_result: Mutex::new(None),
+                    skybox_texture: Mutex::new(None),
+                    pc_raw_sender,
+                    pc_raw_receiver,
+                }
             }),
 
             // File loading state
@@ -444,6 +456,9 @@ impl WindowContext {
         let aabb = self.pc.bbox();
         self.splatting_args.camera.fit_near_far(aabb);
         
+        // Check for async skybox textures
+        self.check_skybox_texture();
+        
         // Check if async renderer creation has finished (WASM)
         if let Some((new_renderer, new_pc)) = self.shared_state.new_renderer_result.lock().unwrap().take() {
             if let Some(loading_state) = &mut self.loading_state {
@@ -498,18 +513,49 @@ impl WindowContext {
                     pc_raw: None,
                     pending_pc: None,
                 });
-                // Directly try parsing pc_raw here, will be applied in update_loading
-                match io::GenericGaussianPointCloud::load(std::io::Cursor::new(data)) {
-                    Ok(pc_raw) => {
-                         if let Some(ls) = &mut self.loading_state {
-                             log::info!("Successfully parsed point cloud data for {}", name);
-                             ls.pc_raw = Some(pc_raw);
-                             ls.progress = 1.0; // Mark as ready to be applied immediately
-                         }
-                    },
-                    Err(e) => {
-                        log::error!("Failed to parse point cloud from uploaded data: {:?}", e);
-                        self.loading_state = None; // Abort loading
+                
+                // Process the data in a background thread if on native platform
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    let sender = self.shared_state.pc_raw_sender.clone();
+                    let data_clone = data.clone();
+                    let path = PathBuf::from(&name);
+                    
+                    std::thread::spawn(move || {
+                        match io::GenericGaussianPointCloud::load(std::io::Cursor::new(data_clone)) {
+                            Ok(pc_raw) => {
+                                log::info!("Background thread: Parsed point cloud data with {} points", pc_raw.num_points);
+                                if let Err(e) = sender.send((pc_raw, path)) {
+                                    log::error!("Failed to send parsed point cloud through channel: {:?}", e);
+                                }
+                            },
+                            Err(e) => {
+                                log::error!("Background thread: Failed to parse point cloud: {:?}", e);
+                            }
+                        }
+                    });
+                    
+                    // Set initial progress
+                    if let Some(ls) = &mut self.loading_state {
+                        ls.progress = 0.3; // Show that parsing has started
+                    }
+                }
+                
+                // For WASM, parse directly here since there's no true multithreading
+                #[cfg(target_arch = "wasm32")]
+                {
+                    match io::GenericGaussianPointCloud::load(std::io::Cursor::new(data)) {
+                        Ok(pc_raw) => {
+                            if let Some(ls) = &mut self.loading_state {
+                                log::info!("Successfully parsed point cloud data for {}", name);
+                                ls.pc_raw = Some(pc_raw);
+                                ls.progress = 1.0; // Mark as ready to be applied immediately
+                            }
+                        },
+                        Err(e) => {
+                            log::error!("Failed to parse point cloud from uploaded data: {:?}", e);
+                            self.loading_state = None; // Abort loading
+                        }
                     }
                 }
             } else {
@@ -555,7 +601,8 @@ impl WindowContext {
         shapes: Option<FullOutput>,
     ) -> Result<(), wgpu::SurfaceError> {
         // Skip performance measurement during loading to avoid overhead
-        if !self.loading_state.is_some() {
+        let is_loading = self.loading_state.is_some();
+        if !is_loading {
             self.stopwatch.as_mut().map(|s| s.reset());
         }
 
@@ -573,35 +620,35 @@ impl WindowContext {
                     label: Some("render command encoder"),
                 });
 
-        // Always render the scene when loading to maintain visual continuity
-        let is_loading = self.loading_state.is_some();
+        // Decide whether to render the scene
+        let should_render_scene = redraw_scene || is_loading;
         
-        if redraw_scene || is_loading {
-            // During loading, use a simplified rendering path with fewer features
-            // This ensures maximum frame rate during the critical loading period
+        if should_render_scene {
+            // Prepare rendering with simpler path during loading for better performance
             if is_loading {
+                // Use a simplified rendering path for loading state (fewer features)
                 self.renderer.prepare(
                     &mut encoder,
                     &self.wgpu_context.device,
                     &self.wgpu_context.queue,
                     &self.pc,
-                    self.splatting_args,
+                    self.splatting_args.clone(), // Clone to avoid borrow issues
                     &mut None, // Skip stopwatch during loading
                 );
             } else {
-                // Normal path with all features when not loading
+                // Normal rendering path with all features
                 self.renderer.prepare(
                     &mut encoder,
                     &self.wgpu_context.device,
                     &self.wgpu_context.queue,
                     &self.pc,
-                    self.splatting_args,
+                    self.splatting_args.clone(), // Clone to avoid borrow issues
                     (&mut self.stopwatch).into(),
                 );
             }
         }
 
-        // Prepare UI state (always do this to maintain responsiveness)
+        // Always prepare UI to maintain responsiveness
         let ui_state = shapes.map(|shapes| {
             self.ui_renderer.prepare(
                 PhysicalSize {
@@ -621,8 +668,8 @@ impl WindowContext {
             self.stopwatch.as_mut().unwrap().start(&mut encoder, "rasterization").unwrap();
         }
         
-        // Always render during loading, otherwise only when requested
-        if redraw_scene || is_loading {
+        // Render the scene if needed
+        if should_render_scene {
             let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("render pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -643,7 +690,7 @@ impl WindowContext {
             self.stopwatch.as_mut().unwrap().stop(&mut encoder, "rasterization").unwrap();
         }
 
-        // Always render the display to keep the UI responsive
+        // Always render the display
         self.display.render(
             &mut encoder,
             &view_rgb,
@@ -652,7 +699,7 @@ impl WindowContext {
             &self.renderer.render_settings(),
         );
         
-        // Skip performance measurement during loading
+        // Skip unnecessary measurement during loading
         if !is_loading {
             self.stopwatch.as_mut().map(|s| s.end(&mut encoder));
         }
@@ -680,25 +727,28 @@ impl WindowContext {
             self.ui_renderer.cleanup(ui_state)
         }
         
-        // Submit render commands (use lower priority during loading)
-        if is_loading {
-            #[cfg(target_arch = "wasm32")]
-            {
-                // On web, use a callback timeout before submitting to ensure UI remains smooth
+        // Optimize command submission for web
+        #[cfg(target_arch = "wasm32")]
+        {
+            if is_loading {
+                // Use async submission during loading to keep UI responsive
                 let queue = self.wgpu_context.queue.clone();
                 let encoder_finished = encoder.finish();
                 
-                gloo_timers::callback::Timeout::new(1, move || {
+                wasm_bindgen_futures::spawn_local(async move {
+                    // Short yield to browser before GPU submission
+                    gloo_timers::future::TimeoutFuture::new(1).await;
                     queue.submit(Some(encoder_finished));
-                }).forget();
-            }
-            #[cfg(not(target_arch = "wasm32"))]
-            {
-                // On native, just submit normally
+                });
+            } else {
+                // Normal submission path
                 self.wgpu_context.queue.submit(Some(encoder.finish()));
             }
-        } else {
-            // Normal submission path
+        }
+        
+        // Normal submission for native platforms
+        #[cfg(not(target_arch = "wasm32"))]
+        {
             self.wgpu_context.queue.submit(Some(encoder.finish()));
         }
 
@@ -855,7 +905,7 @@ impl WindowContext {
         
         // Don't start loading if already loading or if it's the same file
         if let Some(state) = &self.loading_state {
-            if state.file_path == path { // Compare PathBuf with PathBuf
+            if state.file_path == path {
                 log::warn!("Attempted to load the same file again: {:?}", path);
                 return Ok(());
             }
@@ -863,11 +913,35 @@ impl WindowContext {
         
         log::info!("Starting to load new point cloud from {:?}", path);
         self.loading_state = Some(LoadingState {
-            file_path: path,
+            file_path: path.clone(),
             progress: 0.0,
             start_time: Instant::now(),
             pc_raw: None,
             pending_pc: None,
+        });
+        
+        // Launch background thread using flume channel
+        let sender = self.shared_state.pc_raw_sender.clone();
+        std::thread::spawn(move || {
+            match std::fs::File::open(&path) {
+                Ok(file) => {
+                    match io::GenericGaussianPointCloud::load(file) {
+                        Ok(pc_raw) => {
+                            log::info!("Background thread: Successfully loaded {:?} with {} points", 
+                                      path, pc_raw.num_points);
+                            if let Err(e) = sender.send((pc_raw, path)) {
+                                log::error!("Failed to send point cloud through channel: {:?}", e);
+                            }
+                        },
+                        Err(e) => {
+                            log::error!("Background thread: Failed to load point cloud: {:?}", e);
+                        }
+                    }
+                },
+                Err(e) => {
+                    log::error!("Background thread: Failed to open file: {:?}", e);
+                }
+            }
         });
         
         Ok(())
@@ -877,8 +951,51 @@ impl WindowContext {
     #[cfg(not(target_arch = "wasm32"))]
     fn update_loading(&mut self) -> anyhow::Result<()> {
         if let Some(loading_state) = &mut self.loading_state {
-            // Native Path: Handle file reading and renderer creation (can block)
-            if let Some(pc_raw) = loading_state.pc_raw.take() {
+            // We have a pending PointCloud that needs a renderer
+            if let Some(new_pc) = loading_state.pending_pc.take() {
+                log::info!("Creating new renderer for point cloud with {} points", new_pc.num_points());
+                
+                // Request redraw of current scene while we work
+                self.window.request_redraw();
+                
+                // Make a backup of the current camera parameters
+                let old_camera_pos = self.splatting_args.camera.position;
+                let old_camera_rot = self.splatting_args.camera.rotation;
+                
+                // Create new renderer asynchronously on a separate thread
+                let device = self.wgpu_context.device.clone();
+                let queue = self.wgpu_context.queue.clone();
+                let color_format = self.renderer.color_format();
+                let sh_deg = new_pc.sh_deg();
+                let compressed = new_pc.compressed();
+                let shared_state = self.shared_state.clone();
+                
+                // Move the point cloud to the thread
+                std::thread::spawn(move || {
+                    // Create the renderer in the background
+                    let renderer = pollster::block_on(
+                        GaussianRenderer::new(
+                            &device,
+                            &queue,
+                            color_format,
+                            sh_deg,
+                            compressed
+                        )
+                    );
+                    
+                    // Store results in shared state
+                    let mut renderer_guard = shared_state.new_renderer_result.lock().unwrap();
+                    *renderer_guard = Some((renderer, new_pc));
+                });
+                
+                // Update progress to indicate renderer creation in progress
+                loading_state.progress = 0.9;
+                
+                // Force redraw to show loading indicator
+                self.window.request_redraw();
+                
+            // We have PC data, need to create a PointCloud
+            } else if let Some(pc_raw) = loading_state.pc_raw.take() {
                 log::info!("Creating new point cloud with {} points", pc_raw.num_points);
                 
                 // Create new point cloud
@@ -886,7 +1003,10 @@ impl WindowContext {
                     Ok(new_pc) => {
                         // Store in pending_pc for safe keeping until we're ready to swap
                         loading_state.pending_pc = Some(new_pc);
-                        loading_state.progress = 0.9; // Almost done
+                        loading_state.progress = 0.8; // Almost done
+                        
+                        // Force redraw to update loading progress
+                        self.window.request_redraw();
                     },
                     Err(e) => {
                         log::error!("Failed to create point cloud: {:?}", e);
@@ -894,83 +1014,91 @@ impl WindowContext {
                         return Err(e);
                     }
                 }
-            } else if let Some(new_pc) = loading_state.pending_pc.take() {
-                // We have a new point cloud but need to create renderer
-                log::info!("Creating new renderer for point cloud with {} points", new_pc.num_points());
+            } else if loading_state.progress < 0.7 {
+                // Read file data in background thread using proper channel communication
+                let file_path = loading_state.file_path.clone();
+                let sender = self.shared_state.pc_raw_sender.clone();
                 
-                // Request redraw of the current scene before we start creating the renderer
-                // This ensures we don't block the render thread
-                self.window.request_redraw();
+                log::info!("Starting background file load for: {:?}", file_path);
                 
-                // Make a backup of the current camera parameters
-                let old_camera_pos = self.splatting_args.camera.position;
-                let old_camera_rot = self.splatting_args.camera.rotation;
-                
-                // Create new renderer in a safer way
-                match pollster::block_on(
-                    GaussianRenderer::new(
-                        &self.wgpu_context.device,
-                        &self.wgpu_context.queue,
-                        self.renderer.color_format(),
-                        new_pc.sh_deg(),
-                        new_pc.compressed()
-                    )
-                ) {
-                    new_renderer => {
-                        // Now swap everything in one atomic operation
-                        self.renderer = new_renderer;
-                        self.pc = new_pc;
-                        self.pointcloud_file_path = Some(loading_state.file_path.clone());
-                        
-                        // Adjust camera to view the new point cloud
-                        let aabb = self.pc.bbox();
-                        self.splatting_args.camera.fit_near_far(aabb);
-                        self.controller.center = self.pc.center();
-                        
-                        // Preserve camera orientation
-                        self.splatting_args.camera.position = old_camera_pos;
-                        self.splatting_args.camera.rotation = old_camera_rot;
-                        
-                        // Clear loading state
-                        self.loading_state = None;
-                        
-                        // Request a redraw with the new point cloud
-                        self.window.request_redraw();
-                        log::info!("New point cloud loaded successfully");
-                    }
-                }
-            } else if loading_state.progress < 1.0 {
-                // No pc_raw or pending_pc, so we need to load the file
-                if loading_state.progress >= 0.9 {
-                    // If we're almost done, actually load the file
-                    let file_path = loading_state.file_path.clone();
+                // Spawn thread for actual file loading
+                std::thread::spawn(move || {
                     match std::fs::File::open(&file_path) {
                         Ok(file) => {
                             match io::GenericGaussianPointCloud::load(file) {
                                 Ok(pc_raw) => {
-                                    log::info!("Loaded point cloud data from {:?}", file_path);
-                                    loading_state.pc_raw = Some(pc_raw);
-                                    loading_state.progress = 1.0;
+                                    log::info!("Background thread: Loaded point cloud with {} points", pc_raw.num_points);
+                                    // Send directly through the channel
+                                    if let Err(e) = sender.send((pc_raw, file_path)) {
+                                        log::error!("Failed to send point cloud through channel: {:?}", e);
+                                    }
                                 },
                                 Err(e) => {
-                                    log::error!("Failed to load point cloud: {:?}", e);
-                                    self.loading_state = None;
-                                    return Err(e);
+                                    log::error!("Background thread: Failed to load point cloud: {:?}", e);
                                 }
                             }
                         },
                         Err(e) => {
-                            log::error!("Failed to open file: {:?}", e);
-                            self.loading_state = None;
-                            return Err(e.into());
+                            log::error!("Background thread: Failed to open file: {:?}", e);
                         }
                     }
-                } else {
-                    // Simulate progress until we're ready to load
-                    loading_state.progress += 0.1;
+                });
+                
+                // Set progress to indicate file loading in progress
+                loading_state.progress = 0.7;
+                
+                // Force redraw to show updated progress
+                self.window.request_redraw();
+            }
+            
+            // Check if any point cloud data has been received through the channel
+            if let Ok((pc_raw, path)) = self.shared_state.pc_raw_receiver.try_recv() {
+                if let Some(loading_state) = &mut self.loading_state {
+                    if loading_state.file_path == path {
+                        log::info!("Received point cloud data through channel for: {:?}", path);
+                        loading_state.pc_raw = Some(pc_raw);
+                        loading_state.progress = 0.75;
+                        self.window.request_redraw();
+                    } else {
+                        log::warn!("Received point cloud data for wrong path: expected {:?}, got {:?}", 
+                            loading_state.file_path, path);
+                    }
                 }
             }
         }
+        
+        // Check for new renderer + pointcloud from background thread
+        if let Some((new_renderer, new_pc)) = self.shared_state.new_renderer_result.lock().unwrap().take() {
+            if let Some(loading_state) = &mut self.loading_state {
+                log::info!("New point cloud fully loaded and ready to apply");
+                
+                // Grab camera parameters before swapping
+                let old_camera_pos = self.splatting_args.camera.position;
+                let old_camera_rot = self.splatting_args.camera.rotation;
+                
+                // Swap everything in one atomic operation
+                self.renderer = new_renderer;
+                self.pc = new_pc;
+                self.pointcloud_file_path = Some(loading_state.file_path.clone());
+                
+                // Adjust camera to view the new point cloud
+                let aabb = self.pc.bbox();
+                self.splatting_args.camera.fit_near_far(aabb);
+                self.controller.center = self.pc.center();
+                
+                // Preserve camera orientation
+                self.splatting_args.camera.position = old_camera_pos;
+                self.splatting_args.camera.rotation = old_camera_rot;
+                
+                // Clear loading state
+                self.loading_state = None;
+                
+                // Force redraw with new point cloud
+                self.window.request_redraw();
+                log::info!("New point cloud applied successfully");
+            }
+        }
+        
         Ok(())
     }
 
@@ -996,7 +1124,7 @@ impl WindowContext {
                     log::info!("WASM: Async task started: Creating PointCloud...");
                     
                     // Allow UI to update before starting intensive work
-                    gloo_timers::callback::Timeout::new(10, || {}).forget();
+                    gloo_timers::future::TimeoutFuture::new(10).await;
                     
                     // Create PointCloud in a separate task to avoid blocking the UI
                     let new_pc = match PointCloud::new(&device, pc_raw) {
@@ -1010,29 +1138,25 @@ impl WindowContext {
                         }
                     };
                     
-                    // Yield back to the browser multiple times to ensure UI responsiveness
-                    // This splits the work into smaller chunks
-                    gloo_timers::callback::Timeout::new(20, || {}).forget();
+                    // Yield back to the browser to ensure UI responsiveness
+                    gloo_timers::future::TimeoutFuture::new(20).await;
                     
                     let sh_deg = new_pc.sh_deg();
                     let compressed = new_pc.compressed();
                     
                     log::info!("WASM: Creating GaussianRenderer...");
                     
-                    // Pre-create resources before awaiting
-                    let renderer_future = GaussianRenderer::new(
+                    // Create the renderer asynchronously - make mutable
+                    let mut renderer = GaussianRenderer::new(
                         &device,
                         &queue,
                         color_format,
                         sh_deg,
                         compressed
-                    );
+                    ).await;
                     
                     // Let browser process events
-                    gloo_timers::callback::Timeout::new(20, || {}).forget();
-                    
-                    // Create the renderer
-                    let mut renderer = renderer_future.await;
+                    gloo_timers::future::TimeoutFuture::new(20).await;
                     
                     // Critical step: Pre-initialize the renderer with the new point cloud
                     // This ensures the first frame with the new point cloud is fully prepared
@@ -1057,7 +1181,7 @@ impl WindowContext {
                     queue.submit(Some(encoder.finish()));
                     
                     // Let browser process events one more time
-                    gloo_timers::callback::Timeout::new(10, || {}).forget();
+                    gloo_timers::future::TimeoutFuture::new(10).await;
                     
                     log::info!("WASM: Async task complete: PointCloud and Renderer fully initialized and ready.");
                     
@@ -1074,16 +1198,23 @@ impl WindowContext {
                 let elapsed = Instant::now().duration_since(loading_state.start_time);
                 let elapsed_secs = elapsed.as_secs_f32();
                 
-                // Create a more realistic progress indicator based on time
-                if loading_state.progress < 0.95 {
+                // Create a more realistic progress indicator based on time and phase
+                if loading_state.progress < 0.1 {
+                    // Initial phase: Just started
+                    loading_state.progress = (elapsed_secs / 1.0).min(0.1);
+                } else if loading_state.progress < 0.5 {
+                    // Either waiting for parsing or in PointCloud creation
+                    loading_state.progress = (0.1 + (elapsed_secs / 3.0) * 0.4).min(0.5);
+                } else if loading_state.progress < 0.95 {
+                    // PointCloud created, renderer being made
                     if elapsed_secs < 2.0 {
-                        // First phase: Creating point cloud (up to 70%)
+                        // Creating renderer (up to 70%)
                         loading_state.progress = (0.5 + (elapsed_secs / 2.0) * 0.2).min(0.7); 
                     } else if elapsed_secs < 4.0 {
-                        // Second phase: Creating renderer (up to 90%)
+                        // Renderer created, preparing (up to 90%)
                         loading_state.progress = (0.7 + ((elapsed_secs - 2.0) / 2.0) * 0.2).min(0.9);
                     } else {
-                        // Final phase: Pre-rendering & initialization (up to 95%)
+                        // Final initialization (up to 95%)
                         loading_state.progress = (0.9 + ((elapsed_secs - 4.0) / 2.0) * 0.05).min(0.95);
                     }
                 }
@@ -1093,6 +1224,18 @@ impl WindowContext {
             }
         }
         Ok(())
+    }
+
+    // Method to check for and apply pending skybox texture
+    fn check_skybox_texture(&mut self) {
+        if let Some(texture) = self.shared_state.skybox_texture.lock().unwrap().take() {
+            log::info!("Applying async loaded skybox texture");
+            self.display.set_env_map(
+                &self.wgpu_context.device,
+                Some(&texture.create_view(&Default::default())),
+            );
+            self.splatting_args.show_env_map = true;
+        }
     }
 }
 
@@ -1111,27 +1254,24 @@ pub async fn open_window<R: Read + Seek + Send + Sync + 'static>(
     env_logger::init();
     let event_loop = EventLoop::new().unwrap();
 
-    let scene = scene_file.and_then(|f| match Scene::from_json(f) {
-        Ok(s) => Some(s),
-        Err(err) => {
-            log::error!("cannot load scene: {:?}", err);
+    // Start loading scene in background
+    let scene_future = async {
+        if let Some(scene_file) = scene_file {
+            match Scene::from_json(scene_file) {
+                Ok(s) => Some(s),
+                Err(err) => {
+                    log::error!("cannot load scene: {:?}", err);
+                    None
+                }
+            }
+        } else {
             None
         }
-    });
+    };
 
-    // let window_size = if let Some(scene) = &scene {
-    //     let camera = scene.camera(0).unwrap();
-    //     let factor = 1200. / camera.width as f32;
-    //     LogicalSize::new(
-    //         (camera.width as f32 * factor) as u32,
-    //         (camera.height as f32 * factor) as u32,
-    //     )
-    // } else {
-    //     LogicalSize::new(800, 600)
-    // };
     let window_size = LogicalSize::new(800, 600);
     let window_attributes = Window::default_attributes()
-        .with_inner_size( window_size)
+        .with_inner_size(window_size)
         .with_title(format!(
             "{} ({})",
             env!("CARGO_PKG_NAME"),
@@ -1175,18 +1315,45 @@ pub async fn open_window<R: Read + Seek + Send + Sync + 'static>(
         })
         .unwrap_or(Duration::from_millis(17));
 
+    // Create window context first
     let mut state = WindowContext::new(window, file, &config).await.unwrap();
     state.pointcloud_file_path = pointcloud_file_path;
 
+    // Load scene (this was done in parallel, just use result)
+    let scene = scene_future.await;
     if let Some(scene) = scene {
         state.set_scene(scene);
         state.set_scene_camera(0);
         state.scene_file_path = scene_file_path;
     }
 
+    // Load skybox if provided
     if let Some(skybox) = &config.skybox {
+        #[cfg(target_arch = "wasm32")]
+        {
+            // For web, load asynchronously
+            let skybox_path = skybox.clone();
+            let device = state.wgpu_context.device.clone();
+            let queue = state.wgpu_context.queue.clone();
+            let shared_state = state.shared_state.clone();
+            
+            wasm_bindgen_futures::spawn_local(async move {
+                match load_skybox_async(&skybox_path, &device, &queue).await {
+                    Ok(texture) => {
+                        log::info!("Skybox loaded asynchronously");
+                        let mut skybox_guard = shared_state.skybox_texture.lock().unwrap();
+                        *skybox_guard = Some(texture);
+                    },
+                    Err(e) => {
+                        log::error!("Failed to load skybox: {:?}", e);
+                    }
+                }
+            });
+        }
+        
+        #[cfg(not(target_arch = "wasm32"))]
         if let Err(e) = state.set_env_map(skybox.as_path()) {
-            log::error!("failed do set skybox: {e}");
+            log::error!("Failed to set skybox: {e}");
         }
     }
 
@@ -1204,201 +1371,199 @@ pub async fn open_window<R: Read + Seek + Send + Sync + 'static>(
     let mut last = Instant::now();
 
     #[allow(deprecated)]
-    event_loop.run(move |event,target| 
-        
+    event_loop.run(move |event, target| 
         match event {
-            Event::NewEvents(e) =>  match e{
-                winit::event::StartCause::ResumeTimeReached { .. }=>{
+            Event::NewEvents(e) => match e {
+                winit::event::StartCause::ResumeTimeReached { .. } => {
                     state.window.request_redraw();
                 }
-                _=>{}
+                _ => {}
             },
-        Event::WindowEvent {
-            ref event,
-            window_id,
-        } if window_id == state.window.id() && !state.ui_renderer.on_event(&state.window,event) => match event {
-            WindowEvent::Resized(physical_size) => {
-                state.resize(*physical_size, None);
-            }
-            WindowEvent::ScaleFactorChanged {
-                scale_factor,
-                ..
-            } => {
-                state.scale_factor = *scale_factor as f32;
-            }
-            WindowEvent::CloseRequested => {log::info!("close!");target.exit()},
-            WindowEvent::ModifiersChanged(m)=>{
-                state.controller.alt_pressed = m.state().alt_key();
-            }
-            WindowEvent::KeyboardInput { event, .. } => {
-                if let PhysicalKey::Code(key) = event.physical_key{
-                if event.state == ElementState::Released{
-
-                    if key == KeyCode::KeyT{
-                        if state.animation.is_none(){
-                            state.start_tracking_shot();
-                        }else{
-                            state.stop_animation()
-                        }
-                    }else if key == KeyCode::KeyU{
-                        state.ui_visible = !state.ui_visible;
-                        
-                    }else if key == KeyCode::KeyC{
-                        state.save_view();
-                    } else if key == KeyCode::KeyO {
-                        // Add a keyboard shortcut for opening a PLY file
-                        cfg_if! {
-                            if #[cfg(target_arch = "wasm32")] {
-                                use wasm_bindgen_futures::spawn_local;
-                                if state.loading_state.is_none() {
-                                    log::info!("Opening file dialog...");
-                                    let shared_state_clone = state.shared_state.clone();
-                                    spawn_local(async move {
-                                        if let Some(file_handle) = AsyncFileDialog::new()
-                                            .add_filter("PLY Files", &["ply"])
-                                            .pick_file()
-                                            .await
-                                        {
-                                            log::info!("File selected, reading data...");
-                                            let data = file_handle.read().await;
-                                            let name = file_handle.file_name();
-                                            log::info!("Read {} bytes from {}", data.len(), name);
-                                            let mut request = shared_state_clone.file_load_request.lock().unwrap();
-                                            *request = Some((data, name));
-                                            // Request redraw implicitly handled by checking state in update loop
-                                        } else {
-                                            log::info!("File selection cancelled.");
-                                        }
-                                    });
+            Event::WindowEvent {
+                ref event,
+                window_id,
+            } if window_id == state.window.id() && !state.ui_renderer.on_event(&state.window, event) => match event {
+                WindowEvent::Resized(physical_size) => {
+                    state.resize(*physical_size, None);
+                }
+                WindowEvent::ScaleFactorChanged {
+                    scale_factor,
+                    ..
+                } => {
+                    state.scale_factor = *scale_factor as f32;
+                }
+                WindowEvent::CloseRequested => {log::info!("close!"); target.exit()},
+                WindowEvent::ModifiersChanged(m) => {
+                    state.controller.alt_pressed = m.state().alt_key();
+                }
+                WindowEvent::KeyboardInput { event, .. } => {
+                    if let PhysicalKey::Code(key) = event.physical_key {
+                        if event.state == ElementState::Released {
+                            if key == KeyCode::KeyT {
+                                if state.animation.is_none() {
+                                    state.start_tracking_shot();
                                 } else {
-                                    log::warn!("Already loading a file, cannot open another.");
+                                    state.stop_animation()
                                 }
-                            } else {
-                                // Native platform: use synchronous dialog
-                                if state.loading_state.is_none() {
-                                    if let Some(path) = FileDialog::new()
-                                        .add_filter("PLY Files", &["ply"])
-                                        .pick_file()
-                                    {
-                                        if let Err(err) = state.load_new_file(&path) {
-                                            log::error!("failed to load file: {:?}", err);
+                            } else if key == KeyCode::KeyU {
+                                state.ui_visible = !state.ui_visible;
+                                
+                            } else if key == KeyCode::KeyC {
+                                state.save_view();
+                            } else if key == KeyCode::KeyO {
+                                // Add a keyboard shortcut for opening a PLY file
+                                cfg_if! {
+                                    if #[cfg(target_arch = "wasm32")] {
+                                        use wasm_bindgen_futures::spawn_local;
+                                        if state.loading_state.is_none() {
+                                            log::info!("Opening file dialog...");
+                                            let shared_state_clone = state.shared_state.clone();
+                                            spawn_local(async move {
+                                                if let Some(file_handle) = AsyncFileDialog::new()
+                                                    .add_filter("PLY Files", &["ply"])
+                                                    .pick_file()
+                                                    .await
+                                                {
+                                                    log::info!("File selected, reading data...");
+                                                    let data = file_handle.read().await;
+                                                    let name = file_handle.file_name();
+                                                    log::info!("Read {} bytes from {}", data.len(), name);
+                                                    let mut request = shared_state_clone.file_load_request.lock().unwrap();
+                                                    *request = Some((data, name));
+                                                    // Request redraw implicitly handled by checking state in update loop
+                                                } else {
+                                                    log::info!("File selection cancelled.");
+                                                }
+                                            });
+                                        } else {
+                                            log::warn!("Already loading a file, cannot open another.");
+                                        }
+                                    } else {
+                                        // Native platform: use synchronous dialog
+                                        if state.loading_state.is_none() {
+                                            if let Some(path) = FileDialog::new()
+                                                .add_filter("PLY Files", &["ply"])
+                                                .pick_file()
+                                            {
+                                                if let Err(err) = state.load_new_file(&path) {
+                                                    log::error!("failed to load file: {:?}", err);
+                                                }
+                                            }
+                                        } else {
+                                            log::warn!("Already loading a file, cannot open another.");
                                         }
                                     }
-                                } else {
-                                    log::warn!("Already loading a file, cannot open another.");
+                                }
+                            } else if key == KeyCode::KeyR && state.controller.alt_pressed {
+                                if let Err(err) = state.reload() {
+                                    log::error!("failed to reload volume: {:?}", err);
+                                }   
+                            } else if let Some(scene) = &state.scene {
+                                let new_camera = 
+                                    if let Some(num) = key_to_num(key) {
+                                        Some(num as usize)
+                                    }
+                                    else if key == KeyCode::KeyR {
+                                        Some((rand::random::<u32>() as usize) % scene.num_cameras())
+                                    } else if key == KeyCode::KeyN {
+                                        scene.nearest_camera(state.splatting_args.camera.position,None)
+                                    } else if key == KeyCode::PageUp {
+                                        Some(state.current_view.map_or(0, |v| v+1) % scene.num_cameras())
+                                    } else if key == KeyCode::KeyT {
+                                        Some(state.current_view.map_or(0, |v| v+1) % scene.num_cameras())
+                                    }
+                                    else if key == KeyCode::PageDown {
+                                        Some(state.current_view.map_or(0, |v| v-1) % scene.num_cameras())
+                                    } else {
+                                        None
+                                    };
+
+                                if let Some(new_camera) = new_camera {
+                                    state.set_scene_camera(new_camera);
                                 }
                             }
                         }
-                    } else  if key == KeyCode::KeyR && state.controller.alt_pressed{
-                        if let Err(err) = state.reload(){
-                            log::error!("failed to reload volume: {:?}", err);
-                        }   
-                    }else if let Some(scene) = &state.scene{
+                        state.controller.process_keyboard(key, event.state == ElementState::Pressed);
+                    }
+                }
+                WindowEvent::MouseWheel { delta, .. } => match delta {
+                    winit::event::MouseScrollDelta::LineDelta(_, dy) => {
+                        state.controller.process_scroll(*dy)
+                    }
+                    winit::event::MouseScrollDelta::PixelDelta(p) => {
+                        state.controller.process_scroll(p.y as f32 / 100.)
+                    }
+                },
+                WindowEvent::MouseInput { state: button_state, button, .. } => {
+                    match button {
+                        winit::event::MouseButton::Left => state.controller.left_mouse_pressed = *button_state == ElementState::Pressed,
+                        winit::event::MouseButton::Right => state.controller.right_mouse_pressed = *button_state == ElementState::Pressed,
+                        _ => {}
+                    }
+                }
+                WindowEvent::RedrawRequested => {
+                    if !config.no_vsync {
+                        // make sure the next redraw is called with a small delay
+                        target.set_control_flow(ControlFlow::wait_duration(min_wait));
+                    }
+                    let now = Instant::now();
+                    let dt = now-last;
+                    last = now;
 
-                        let new_camera = 
-                        if let Some(num) = key_to_num(key){
-                            Some(num as usize)
-                        }
-                        else if key == KeyCode::KeyR{
-                            Some((rand::random::<u32>() as usize)%scene.num_cameras())
-                        }else if key == KeyCode::KeyN{
-                            scene.nearest_camera(state.splatting_args.camera.position,None)
-                        }else if key == KeyCode::PageUp{
-                            Some(state.current_view.map_or(0, |v|v+1) % scene.num_cameras())
-                        }else if key == KeyCode::KeyT{
-                            Some(state.current_view.map_or(0, |v|v+1) % scene.num_cameras())
-                        }
-                        else if key == KeyCode::PageDown{
-                            Some(state.current_view.map_or(0, |v|v-1) % scene.num_cameras())
-                        }else{None};
+                    let old_settings = state.splatting_args.clone();
+                    let old_loading_state = state.loading_state.is_some();
+                    state.update(dt).unwrap();
+                    let new_loading_state = state.loading_state.is_some();
 
-                        if let Some(new_camera) = new_camera{
-                            state.set_scene_camera(new_camera);
+                    let (redraw_ui, shapes) = state.ui();
+
+                    let resolution_change = state.splatting_args.resolution != Vector2::new(state.config.width, state.config.height);
+
+                    // Check if any state has changed that requires a redraw
+                    let request_redraw = old_settings != state.splatting_args 
+                        || resolution_change 
+                        || old_loading_state != new_loading_state
+                        || state.loading_state.is_some(); // Always redraw while loading
+        
+                    if request_redraw || redraw_ui {
+                        // During loading, prioritize smooth UI updates by not calculating FPS
+                        // which can cause stuttering due to smoothing calculations
+                        if !state.loading_state.is_some() {
+                            state.fps = (1. / dt.as_secs_f32()) * 0.05 + state.fps * 0.95;
+                        }
+                        
+                        match state.render(request_redraw, state.ui_visible.then_some(shapes)) {
+                            Ok(_) => {}
+                            // Reconfigure the surface if lost
+                            Err(wgpu::SurfaceError::Lost) => state.resize(state.window.inner_size(), None),
+                            // The system is out of memory, we should probably quit
+                            Err(wgpu::SurfaceError::OutOfMemory) => target.exit(),
+                            // All other errors (Outdated, Timeout) should be resolved by the next frame
+                            Err(e) => println!("error: {:?}", e),
+                        }
+                    }
+                    
+                    // Always request a redraw when loading a file to keep progress bar updating and scene rendering
+                    if state.loading_state.is_some() || config.no_vsync {
+                        state.window.request_redraw();
+                        
+                        // Set polling mode during loading for maximum responsiveness
+                        if state.loading_state.is_some() {
+                            target.set_control_flow(ControlFlow::Poll);
                         }
                     }
                 }
-                state
-                    .controller
-                    .process_keyboard(key, event.state == ElementState::Pressed);
-            }
-            }
-            WindowEvent::MouseWheel { delta, .. } => match delta {
-                winit::event::MouseScrollDelta::LineDelta(_, dy) => {
-                    state.controller.process_scroll(*dy )
-                }
-                winit::event::MouseScrollDelta::PixelDelta(p) => {
-                    state.controller.process_scroll(p.y as f32 / 100.)
-                }
+                _ => {}
             },
-            WindowEvent::MouseInput { state:button_state, button, .. }=>{
-                match button {
-                    winit::event::MouseButton::Left =>                         state.controller.left_mouse_pressed = *button_state == ElementState::Pressed,
-                    winit::event::MouseButton::Right => state.controller.right_mouse_pressed = *button_state == ElementState::Pressed,
-                    _=>{}
-                }
+            Event::DeviceEvent {
+                event: DeviceEvent::MouseMotion{ delta, },
+                .. // We're not using device_id currently
+            } => {
+                state.controller.process_mouse(delta.0 as f32, delta.1 as f32)
             }
-            WindowEvent::RedrawRequested => {
-                if !config.no_vsync{
-                    // make sure the next redraw is called with a small delay
-                    target.set_control_flow(ControlFlow::wait_duration(min_wait));
-                }
-                let now = Instant::now();
-                let dt = now-last;
-                last = now;
-
-                let old_settings = state.splatting_args.clone();
-                let old_loading_state = state.loading_state.is_some();
-                state.update(dt).unwrap();
-                let new_loading_state = state.loading_state.is_some();
-
-                let (redraw_ui,shapes) = state.ui();
-
-                let resolution_change = state.splatting_args.resolution != Vector2::new(state.config.width, state.config.height);
-
-                // Check if any state has changed that requires a redraw
-                let request_redraw = old_settings != state.splatting_args 
-                    || resolution_change 
-                    || old_loading_state != new_loading_state
-                    || state.loading_state.is_some(); // Always redraw while loading
-    
-                if request_redraw || redraw_ui {
-                    // During loading, prioritize smooth UI updates by not calculating FPS
-                    // which can cause stuttering due to smoothing calculations
-                    if !state.loading_state.is_some() {
-                        state.fps = (1. / dt.as_secs_f32()) * 0.05 + state.fps * 0.95;
-                    }
-                    
-                    match state.render(request_redraw, state.ui_visible.then_some(shapes)) {
-                        Ok(_) => {}
-                        // Reconfigure the surface if lost
-                        Err(wgpu::SurfaceError::Lost) => state.resize(state.window.inner_size(), None),
-                        // The system is out of memory, we should probably quit
-                        Err(wgpu::SurfaceError::OutOfMemory) => target.exit(),
-                        // All other errors (Outdated, Timeout) should be resolved by the next frame
-                        Err(e) => println!("error: {:?}", e),
-                    }
-                }
-                
-                // Always request a redraw when loading a file to keep progress bar updating and scene rendering
-                if state.loading_state.is_some() || config.no_vsync {
-                    state.window.request_redraw();
-                    
-                    // Set polling mode during loading for maximum responsiveness
-                    if state.loading_state.is_some() {
-                        target.set_control_flow(ControlFlow::Poll);
-                    }
-                }
-            }
-            _ => {}
-        },
-        Event::DeviceEvent {
-            event: DeviceEvent::MouseMotion{ delta, },
-            .. // We're not using device_id currently
-        } => {
-            state.controller.process_mouse(delta.0 as f32, delta.1 as f32)
+            _ => {},
         }
-        _ => {},
-    });
+    );
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -1427,4 +1592,47 @@ pub async fn run_wasm(
         pc_file.and_then(|s| PathBuf::from_str(s.as_str()).ok()),
         scene_file.and_then(|s| PathBuf::from_str(s.as_str()).ok()),
     ));
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn load_skybox_async<P: AsRef<Path>>(
+    path: P,
+    device: &wgpu::Device, 
+    queue: &wgpu::Queue
+) -> Result<wgpu::Texture, anyhow::Error> {
+    // On web, we would need to fetch the image using web APIs
+    // For now, let's simulate this with a delay
+    gloo_timers::future::TimeoutFuture::new(100).await;
+    
+    // In reality, you'd use browser APIs through web_sys to fetch and load the image
+    // Here's a stub for the real implementation
+    let env_map_exr = image::open(path)?;
+    let env_map_data: Vec<[f32; 4]> = env_map_exr
+        .as_rgb32f()
+        .ok_or(anyhow::anyhow!("env map must be rgb"))?
+        .pixels()
+        .map(|p| p.to_rgba().0)
+        .collect();
+
+    let env_texture = device.create_texture_with_data(
+        queue,
+        &wgpu::TextureDescriptor {
+            label: Some("env map texture"),
+            size: Extent3d {
+                width: env_map_exr.width(),
+                height: env_map_exr.height(),
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba32Float,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        },
+        wgpu::util::TextureDataOrder::LayerMajor,
+        bytemuck::cast_slice(&env_map_data.as_slice()),
+    );
+    
+    Ok(env_texture)
 }

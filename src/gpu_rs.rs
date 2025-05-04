@@ -307,16 +307,12 @@ impl GPURSSorter {
             label: Some("GPURSSorter test_sort"),
         });
         self.record_sort(&bind_group, n, &mut encoder);
-        let idx = queue.submit([encoder.finish()]);
-        device.poll(wgpu::Maintain::WaitForSubmissionIndex(idx));
+        queue.submit([encoder.finish()]);
 
         let sorted = download_buffer::<f32>(&keyval_a, device, queue).await;
-        for i in 0..n {
-            if sorted[i] != sorted_data[i] {
-                return false;
-            }
-        }
-        return true;
+        
+        // Compare results
+        sorted.iter().zip(sorted_data.iter()).all(|(a, b)| a == b)
     }
 
     // layouts used by the sorting pipeline, as the dispatch buffer has to be in separate bind group
@@ -465,15 +461,16 @@ impl GPURSSorter {
     }
 
     fn get_scatter_histogram_sizes(keysize: usize) -> (usize, usize, usize, usize, usize, usize) {
-        // as a general rule of thumb, scater_blocks_ru is equal to histo_blocks_ru, except the amount of elements in these two stages is different
-
+        // Calculate scatter block parameters
         let scatter_block_kvs = HISTOGRAM_WG_SIZE * RS_SCATTER_BLOCK_ROWS;
         let scatter_blocks_ru = (keysize + scatter_block_kvs - 1) / scatter_block_kvs;
         let count_ru_scatter = scatter_blocks_ru * scatter_block_kvs;
 
+        // Calculate histogram block parameters using the scatter block size
+        // This ensures alignment between scatter and histogram phases
         let histo_block_kvs = HISTOGRAM_WG_SIZE * RS_HISTOGRAM_BLOCK_ROWS;
-        let histo_blocks_ru = (count_ru_scatter + histo_block_kvs - 1) / histo_block_kvs;
-        let count_ru_histo = histo_blocks_ru * histo_block_kvs;
+        let histo_blocks_ru = scatter_blocks_ru; // Since RS_SCATTER_BLOCK_ROWS = RS_HISTOGRAM_BLOCK_ROWS
+        let count_ru_histo = count_ru_scatter;
 
         return (
             scatter_block_kvs,
@@ -490,44 +487,35 @@ impl GPURSSorter {
         keysize: usize,
         bytes_per_payload_elem: usize,
     ) -> (wgpu::Buffer, wgpu::Buffer, wgpu::Buffer, wgpu::Buffer) {
-        //let (_, _, _, _, _, count_ru_histo) = Self::get_scatter_histogram_sizes(keysize);
         let keys_per_workgroup = HISTOGRAM_WG_SIZE * RS_HISTOGRAM_BLOCK_ROWS;
         let count_ru_histo =
             ((keysize + keys_per_workgroup) / keys_per_workgroup + 1) * keys_per_workgroup;
 
-        // creating the two needed buffers for sorting
+        // Minimal required buffer usage flags to improve performance
         let buffer_a = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Radix data buffer a"),
             size: (count_ru_histo * std::mem::size_of::<f32>()) as u64,
-            usage: wgpu::BufferUsages::STORAGE
-                | wgpu::BufferUsages::COPY_DST
-                | wgpu::BufferUsages::COPY_SRC,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
         let buffer_b = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("Radix data buffer a"),
+            label: Some("Radix data buffer b"),
             size: (count_ru_histo * std::mem::size_of::<f32>()) as u64,
-            usage: wgpu::BufferUsages::STORAGE
-                | wgpu::BufferUsages::COPY_DST
-                | wgpu::BufferUsages::COPY_SRC,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
         assert!(bytes_per_payload_elem == 4); // currently only 4 byte values are allowed
         let payload_size = (keysize * bytes_per_payload_elem).max(1); // make sure that we have at least 1 byte of data;
         let payload_a = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("Radix data buffer a"),
+            label: Some("Radix payload buffer a"),
             size: payload_size as u64,
-            usage: wgpu::BufferUsages::STORAGE
-                | wgpu::BufferUsages::COPY_DST
-                | wgpu::BufferUsages::COPY_SRC,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
         let payload_b = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("Radix data buffer a"),
+            label: Some("Radix payload buffer b"),
             size: payload_size as u64,
-            usage: wgpu::BufferUsages::STORAGE
-                | wgpu::BufferUsages::COPY_DST
-                | wgpu::BufferUsages::COPY_SRC,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
         return (buffer_a, buffer_b, payload_a, payload_b);
@@ -541,36 +529,17 @@ impl GPURSSorter {
         device: &wgpu::Device,
         keysize: usize,
     ) -> wgpu::Buffer {
-        // currently only a few different key bits are supported, maybe has to be extended
-        // assert!(key_bits == 32 || key_bits == 64 || key_bits == 16);
-
-        // subgroup and workgroup sizes
-        let histo_sg_size: usize = self.subgroup_size;
-        let _histo_wg_size: usize = HISTOGRAM_WG_SIZE;
-        let _prefix_sg_size: usize = histo_sg_size;
-        let _internal_sg_size: usize = histo_sg_size;
-
-        // The "internal" memory map looks like this:
-        //   +---------------------------------+ <-- 0
-        //   | histograms[keyval_size]         |
-        //   +---------------------------------+ <-- keyval_size                           * histo_size
-        //   | partitions[scatter_blocks_ru-1] |
-        //   +---------------------------------+ <-- (keyval_size + scatter_blocks_ru - 1) * histo_size
-        //   | workgroup_ids[keyval_size]      |
-        //   +---------------------------------+ <-- (keyval_size + scatter_blocks_ru - 1) * histo_size + workgroup_ids_size
-
         let (_, scatter_blocks_ru, _, _, _, _) = Self::get_scatter_histogram_sizes(keysize);
 
         let histo_size = RS_RADIX_SIZE * std::mem::size_of::<u32>();
-
-        let internal_size = (RS_KEYVAL_SIZE + scatter_blocks_ru - 1 + 1) * histo_size; // +1 safety
+        
+        // Exact calculation of needed memory without extra safety padding
+        let internal_size = (RS_KEYVAL_SIZE + scatter_blocks_ru - 1) * histo_size;
 
         let buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Internal radix sort buffer"),
             size: internal_size as u64,
-            usage: wgpu::BufferUsages::STORAGE
-                | wgpu::BufferUsages::COPY_DST
-                | wgpu::BufferUsages::COPY_SRC,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
         return buffer;
@@ -721,13 +690,10 @@ impl GPURSSorter {
         keysize: usize,
         encoder: &mut wgpu::CommandEncoder,
     ) {
-        // histogram has to be zeroed out such that counts that might have been done in the past are erased and do not interfere with the new count
-        // encoder.clear_buffer(histogram_buffer, 0, None);
-
-        // as we only deal with 32 bit float values always 4 passes are conducted
+        // Calculate histogram blocks once instead of twice
         let (_, _, _, _, hist_blocks_ru, _) = Self::get_scatter_histogram_sizes(keysize);
-        const _PASSES: u32 = 4;
 
+        // First pass - zero the histograms
         {
             let mut pass = encoder.begin_compute_pass(&ComputePassDescriptor {
                 label: Some("zeroing the histogram"),
@@ -739,6 +705,7 @@ impl GPURSSorter {
             pass.dispatch_workgroups(hist_blocks_ru as u32, 1, 1);
         }
 
+        // Second pass - calculate histogram
         {
             let mut pass = encoder.begin_compute_pass(&ComputePassDescriptor {
                 label: Some("calculate histogram"),
@@ -879,19 +846,24 @@ fn upload_to_buffer<T: bytemuck::Pod>(
     queue: &wgpu::Queue,
     values: &[T],
 ) {
-    let staging_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label: Some("Staging buffer"),
-        contents: bytemuck::cast_slice(values),
-        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-    });
-    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-        label: Some("Copye endoder"),
-    });
-    encoder.copy_buffer_to_buffer(&staging_buffer, 0, buffer, 0, staging_buffer.size());
-    queue.submit([encoder.finish()]);
-
-    device.poll(wgpu::Maintain::Wait);
-    staging_buffer.destroy();
+    // Write directly to the buffer using queue.write_buffer when possible
+    // This avoids the need for a staging buffer and synchronization
+    let bytes = bytemuck::cast_slice(values);
+    if bytes.len() <= 4*1024*1024 { // Under 4MB, use direct write which is more efficient
+        queue.write_buffer(buffer, 0, bytes);
+    } else {
+        // For larger data, use a staging buffer
+        let staging_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Staging buffer"),
+            contents: bytes,
+            usage: wgpu::BufferUsages::COPY_SRC,
+        });
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("Copy encoder"),
+        });
+        encoder.copy_buffer_to_buffer(&staging_buffer, 0, buffer, 0, staging_buffer.size());
+        queue.submit([encoder.finish()]);
+    }
 }
 
 async fn download_buffer<T: Clone>(
@@ -899,32 +871,38 @@ async fn download_buffer<T: Clone>(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
 ) -> Vec<T> {
-    // copy buffer data
+    // Create a buffer sized only for the data we want to download
+    let element_size = std::mem::size_of::<T>();
+    let download_size = (buffer.size() / element_size as u64) * element_size as u64;
+    
     let download_buffer = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("Download buffer"),
-        size: buffer.size(),
+        size: download_size,
         usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
         mapped_at_creation: false,
     });
+    
+    // Perform the copy in a single encoder
     let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
         label: Some("Copy encoder"),
     });
-    encoder.copy_buffer_to_buffer(buffer, 0, &download_buffer, 0, buffer.size());
+    encoder.copy_buffer_to_buffer(buffer, 0, &download_buffer, 0, download_size);
     queue.submit([encoder.finish()]);
 
-    // download buffer
+    // Map and read the data
     let buffer_slice = download_buffer.slice(..);
     let (tx, rx) = futures_intrusive::channel::shared::oneshot_channel();
     buffer_slice.map_async(wgpu::MapMode::Read, move |result| tx.send(result).unwrap());
     device.poll(wgpu::Maintain::Wait);
     rx.receive().await.unwrap().unwrap();
+    
+    // Extract data efficiently
     let data = buffer_slice.get_mapped_range();
-    let r;
-
+    let result: Vec<T>;
     unsafe {
-        let (_, d, _) = data.align_to::<T>();
-        r = d.to_vec();
+        let (_, aligned_data, _) = data.align_to::<T>();
+        result = aligned_data.to_vec();
     }
 
-    return r;
+    result
 }
