@@ -65,6 +65,8 @@ pub mod gpu_rs;
 mod ui_renderer;
 mod uniform;
 mod utils;
+pub mod state;
+use state::{LoadingState, SharedState};
 
 use cfg_if::cfg_if;
 
@@ -177,29 +179,9 @@ pub struct WindowContext {
     loading_state: Option<LoadingState>,
 }
 
-// Structure to track the loading state of a new PLY file
-pub struct LoadingState {
-    pub file_path: PathBuf,
-    pub progress: f32, // 0.0 to 1.0
-    pub start_time: Instant,
-    pub pc_raw: Option<io::GenericGaussianPointCloud>,
-    pub pending_pc: Option<PointCloud>, // Hold parsed PC while renderer is created
-}
-
-// Shared state for communicating async results back to the main thread
-struct SharedState {
-    file_load_request: Mutex<Option<(Vec<u8>, String)>>, // (file_data, file_name)
-    new_renderer_result: Mutex<Option<(GaussianRenderer, PointCloud)>>, // Holds both renderer and point cloud
-    skybox_texture: Mutex<Option<wgpu::Texture>>, // For async skybox loading
-    
-    // Flume channels for async file loading
-    pc_raw_sender: flume::Sender<(io::GenericGaussianPointCloud, PathBuf)>,
-    pc_raw_receiver: flume::Receiver<(io::GenericGaussianPointCloud, PathBuf)>,
-}
-
 impl WindowContext {
     // Creating some of the wgpu types requires async code
-    async fn new<R: Read + Seek>(
+    async fn new<R: Read + Seek + Send + Sync + 'static>(
         window: Window,
         pc_file: R,
         render_config: &RenderConfig,
@@ -337,16 +319,7 @@ impl WindowContext {
             stopwatch,
             
             // Shared state for async operations like file loading
-            shared_state: Arc::new({
-                let (pc_raw_sender, pc_raw_receiver) = flume::unbounded();
-                SharedState {
-                    file_load_request: Mutex::new(None),
-                    new_renderer_result: Mutex::new(None),
-                    skybox_texture: Mutex::new(None),
-                    pc_raw_sender,
-                    pc_raw_receiver,
-                }
-            }),
+            shared_state: Arc::new(SharedState::new()),
 
             // File loading state
             loading_state: None,
@@ -506,13 +479,7 @@ impl WindowContext {
             if self.loading_state.is_none() {
                 // Start loading from data
                 log::info!("Starting to load new point cloud from uploaded file: {}", name);
-                self.loading_state = Some(LoadingState {
-                    file_path: PathBuf::from(&name), // Store filename as path for consistency (it's PathBuf)
-                    progress: 0.0, // Start progress simulation
-                    start_time: Instant::now(),
-                    pc_raw: None,
-                    pending_pc: None,
-                });
+                self.loading_state = Some(LoadingState::new(PathBuf::from(&name)));
                 
                 // Process the data in a background thread if on native platform
                 #[cfg(not(target_arch = "wasm32"))]
@@ -912,13 +879,7 @@ impl WindowContext {
         }
         
         log::info!("Starting to load new point cloud from {:?}", path);
-        self.loading_state = Some(LoadingState {
-            file_path: path.clone(),
-            progress: 0.0,
-            start_time: Instant::now(),
-            pc_raw: None,
-            pending_pc: None,
-        });
+        self.loading_state = Some(LoadingState::new(path.clone()));
         
         // Launch background thread using flume channel
         let sender = self.shared_state.pc_raw_sender.clone();
@@ -1191,7 +1152,7 @@ impl WindowContext {
                 });
                 
                 // Set progress to indicate an active background operation
-                loading_state.progress = 0.5;
+                loading_state.set_progress(0.5);
                 loading_state.start_time = Instant::now(); // Reset timer for progress estimation
             } else if loading_state.progress < 1.0 {
                 // Calculate elapsed time for better progress estimation
@@ -1201,21 +1162,21 @@ impl WindowContext {
                 // Create a more realistic progress indicator based on time and phase
                 if loading_state.progress < 0.1 {
                     // Initial phase: Just started
-                    loading_state.progress = (elapsed_secs / 1.0).min(0.1);
+                    loading_state.set_progress((elapsed_secs / 1.0).min(0.1));
                 } else if loading_state.progress < 0.5 {
                     // Either waiting for parsing or in PointCloud creation
-                    loading_state.progress = (0.1 + (elapsed_secs / 3.0) * 0.4).min(0.5);
+                    loading_state.set_progress((0.1 + (elapsed_secs / 3.0) * 0.4).min(0.5));
                 } else if loading_state.progress < 0.95 {
                     // PointCloud created, renderer being made
                     if elapsed_secs < 2.0 {
                         // Creating renderer (up to 70%)
-                        loading_state.progress = (0.5 + (elapsed_secs / 2.0) * 0.2).min(0.7); 
+                        loading_state.set_progress((0.5 + (elapsed_secs / 2.0) * 0.2).min(0.7)); 
                     } else if elapsed_secs < 4.0 {
                         // Renderer created, preparing (up to 90%)
-                        loading_state.progress = (0.7 + ((elapsed_secs - 2.0) / 2.0) * 0.2).min(0.9);
+                        loading_state.set_progress((0.7 + ((elapsed_secs - 2.0) / 2.0) * 0.2).min(0.9));
                     } else {
                         // Final initialization (up to 95%)
-                        loading_state.progress = (0.9 + ((elapsed_secs - 4.0) / 2.0) * 0.05).min(0.95);
+                        loading_state.set_progress((0.9 + ((elapsed_secs - 4.0) / 2.0) * 0.05).min(0.95));
                     }
                 }
                 
