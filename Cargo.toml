@@ -46,6 +46,12 @@ cfg-if = "1.0"
 gloo-timers = { version = "0.3.0", features = ["futures"] }
 flume = "0.11.1"
 
+# WebSocket dependencies for live updates
+url = "2.5.0"
+futures-util = "0.3.30"
+zstd = "0.13.0"
+gaussian_utils_rust = { version = "0.1.0", path = "../gaussian_utils_rust" }
+
 [dev-dependencies]
 wasm-bindgen-cli = "0.2.92"
 
@@ -67,6 +73,8 @@ video = []
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 pollster = { version = "0.4.0", features = ["macro"] }
 rfd = "0.15.3"
+tokio = { version = "1.36.0", features = ["rt", "rt-multi-thread", "macros"] }
+tokio-tungstenite = "0.21.0"
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 rfd = "0.15.3"

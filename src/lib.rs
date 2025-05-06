@@ -3,7 +3,6 @@ use std::{
     path::{Path, PathBuf},
     sync::Arc,
 };
-use std::sync::Mutex;
 
 use image::Pixel;
 #[cfg(target_arch = "wasm32")]
@@ -67,8 +66,28 @@ mod uniform;
 mod utils;
 pub mod state;
 use state::{LoadingState, SharedState};
+use state::websocket::ConnectionState;
 
 use cfg_if::cfg_if;
+
+#[cfg(not(target_arch = "wasm32"))]
+use tokio::runtime::Runtime;
+#[cfg(not(target_arch = "wasm32"))]
+use tokio::net::TcpStream;
+#[cfg(not(target_arch = "wasm32"))]
+use tokio_tungstenite::{connect_async, connect_async_with_config, MaybeTlsStream, WebSocketStream, tungstenite::protocol::WebSocketConfig};
+#[cfg(not(target_arch = "wasm32"))]
+use futures_util::{StreamExt, SinkExt};
+#[cfg(not(target_arch = "wasm32"))]
+use url::Url;
+#[cfg(not(target_arch = "wasm32"))]
+use std::io::Cursor;
+#[cfg(not(target_arch = "wasm32"))]
+use zstd::stream::read::Decoder as ZstdDecoder;
+#[cfg(not(target_arch = "wasm32"))]
+use gaussian_utils_rust::gaussians::GaussianCloud;
+#[cfg(not(target_arch = "wasm32"))]
+use gaussian_utils_rust::gaussians::io::spz::{deserialize_packed_gaussians, unpack_gaussians, PackedGaussians};
 
 pub struct RenderConfig {
     pub no_vsync: bool,
@@ -442,8 +461,8 @@ impl WindowContext {
                 self.window.request_redraw();
                 
                 // Make a backup of old camera parameters
-                let old_camera_pos = self.splatting_args.camera.position;
-                let old_camera_rot = self.splatting_args.camera.rotation;
+                let _old_camera_pos = self.splatting_args.camera.position;
+                let _old_camera_rot = self.splatting_args.camera.rotation;
                 
                 // Then in a single atomic operation, replace everything
                 self.renderer = new_renderer;
@@ -458,8 +477,8 @@ impl WindowContext {
                 self.controller.center = self.pc.center();
                 
                 // Keep looking at approximately the same view direction
-                self.splatting_args.camera.position = old_camera_pos;
-                self.splatting_args.camera.rotation = old_camera_rot;
+                self.splatting_args.camera.position = _old_camera_pos;
+                self.splatting_args.camera.rotation = _old_camera_rot;
                 
                 // Now clear the loading state to indicate completion
                 self.loading_state = None;
@@ -544,6 +563,12 @@ impl WindowContext {
             false
         };
 
+        // Check for WebSocket updates
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Err(e) = self.check_websocket_refresh() {
+            log::error!("Error during WebSocket refresh: {:?}", e);
+        }
+        
         // Always request redraw while loading is in progress
         // This keeps the UI responsive and continues to display the current scene
         if self.loading_state.is_some() || loading_needs_redraw {
@@ -920,8 +945,8 @@ impl WindowContext {
                 self.window.request_redraw();
                 
                 // Make a backup of the current camera parameters
-                let old_camera_pos = self.splatting_args.camera.position;
-                let old_camera_rot = self.splatting_args.camera.rotation;
+                let _old_camera_pos = self.splatting_args.camera.position;
+                let _old_camera_rot = self.splatting_args.camera.rotation;
                 
                 // Create new renderer asynchronously on a separate thread
                 let device = self.wgpu_context.device.clone();
@@ -1034,8 +1059,8 @@ impl WindowContext {
                 log::info!("New point cloud fully loaded and ready to apply");
                 
                 // Grab camera parameters before swapping
-                let old_camera_pos = self.splatting_args.camera.position;
-                let old_camera_rot = self.splatting_args.camera.rotation;
+                let _old_camera_pos = self.splatting_args.camera.position;
+                let _old_camera_rot = self.splatting_args.camera.rotation;
                 
                 // Swap everything in one atomic operation
                 self.renderer = new_renderer;
@@ -1048,8 +1073,8 @@ impl WindowContext {
                 self.controller.center = self.pc.center();
                 
                 // Preserve camera orientation
-                self.splatting_args.camera.position = old_camera_pos;
-                self.splatting_args.camera.rotation = old_camera_rot;
+                self.splatting_args.camera.position = _old_camera_pos;
+                self.splatting_args.camera.rotation = _old_camera_rot;
                 
                 // Clear loading state
                 self.loading_state = None;
@@ -1197,6 +1222,336 @@ impl WindowContext {
             );
             self.splatting_args.show_env_map = true;
         }
+    }
+
+    // Check for WebSocket refresh requests and process them
+    #[cfg(not(target_arch = "wasm32"))]
+    fn check_websocket_refresh(&mut self) -> anyhow::Result<()> {
+        // Check if a refresh has been requested
+        let refresh_requested = {
+            let mut refresh_guard = self.shared_state.websocket_refresh_requested.lock().unwrap();
+            let requested = *refresh_guard;
+            *refresh_guard = false; // Reset the flag
+            requested
+        };
+
+        // Get a reference to the WebSocket state
+        let ws_state = self.shared_state.websocket_state.lock().unwrap();
+        
+        // Setup a WebSocket connection if requested or if auto-refresh is due
+        if refresh_requested || ws_state.should_auto_refresh() {
+            // Clone necessary data for the async task
+            let ws_server_url = ws_state.server_url.clone();
+            let websocket_sender = self.shared_state.websocket_data_sender.clone();
+            let shared_state_clone = self.shared_state.clone();
+            
+            // Important: Make a backup of current camera parameters before loading new data
+            let _old_camera_pos = self.splatting_args.camera.position;
+            let _old_camera_rot = self.splatting_args.camera.rotation;
+            
+            // We need to drop the lock before spawning the thread
+            drop(ws_state);
+            
+            // Spawn a new thread for WebSocket communication
+            std::thread::spawn(move || {
+                // Create a tokio runtime in this thread for async operation
+                let rt = match Runtime::new() {
+                    Ok(rt) => rt,
+                    Err(e) => {
+                        let mut ws_state = shared_state_clone.websocket_state.lock().unwrap();
+                        ws_state.set_state(ConnectionState::Error(format!("Failed to create runtime: {}", e)));
+                        return;
+                    }
+                };
+                
+                // Execute the async WebSocket connection
+                rt.block_on(async {
+                    if let Err(e) = connect_to_websocket(ws_server_url.clone(), websocket_sender.clone(), shared_state_clone.clone()).await {
+                        log::error!("WebSocket connection error: {}", e);
+                        // State is already set in the connect_to_websocket function
+                    }
+                });
+            });
+            
+            // Request a redraw to show the refreshed connection state
+            self.window.request_redraw();
+        }
+        
+        // Check if we have received any data through the WebSocket channel
+        if let Ok(data) = self.shared_state.websocket_data_receiver.try_recv() {
+            log::info!("Processing {} bytes of data from WebSocket", data.len());
+            
+            // Set state to receiving
+            {
+                let mut ws_state = self.shared_state.websocket_state.lock().unwrap();
+                ws_state.set_state(ConnectionState::Receiving);
+                ws_state.update_progress(0.5);
+            }
+            
+            // First, try to process as packed gaussians data that has already been decompressed
+            let cursor = Cursor::new(&data);
+            match io::GenericGaussianPointCloud::load(cursor) {
+                Ok(pc_raw) => {
+                    log::info!("Successfully parsed Gaussian data with {} points", pc_raw.num_points);
+                    
+                    // Create a temporary file path for this WebSocket update
+                    let file_path = PathBuf::from("websocket_update.ply");
+                    
+                    // Update the number of points in the UI
+                    {
+                        let mut ws_state = self.shared_state.websocket_state.lock().unwrap();
+                        ws_state.points_received = Some(pc_raw.num_points);
+                    }
+                    
+                    // Send the data through the channel to be processed like a regular file
+                    if let Err(e) = self.shared_state.pc_raw_sender.send((pc_raw, file_path)) {
+                        log::error!("Failed to send parsed WebSocket data: {}", e);
+                        
+                        // Update state to error
+                        let mut ws_state = self.shared_state.websocket_state.lock().unwrap();
+                        ws_state.set_state(ConnectionState::Error(format!("Failed to process data: {}", e)));
+                    } else {
+                        // Successfully sent data for processing
+                        let mut ws_state = self.shared_state.websocket_state.lock().unwrap();
+                        ws_state.update_progress(0.8); // Almost done
+                    }
+                    
+                    // Request redraw to update the UI
+                    self.window.request_redraw();
+                },
+                Err(e) => {
+                    log::error!("Failed to parse WebSocket data: {}", e);
+                    
+                    // Update state to error
+                    let mut ws_state = self.shared_state.websocket_state.lock().unwrap();
+                    ws_state.set_state(ConnectionState::Error(format!("Failed to parse data: {}", e)));
+                }
+            }
+        }
+        
+        Ok(())
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+/// Connect to a WebSocket server and receive Gaussian data
+///
+/// This function establishes a WebSocket connection to the given server URL,
+/// receives a binary message with compressed Gaussian data, and sends it
+/// through the provided channel for further processing.
+///
+/// # Arguments
+///
+/// * `server_url` - The WebSocket server URL (e.g., "ws://localhost:8765")
+/// * `sender` - Flume channel sender to pass the received binary data
+/// * `shared_state` - Reference to the shared state to update status
+///
+/// # Returns
+///
+/// * `Ok(())` if the connection was successful and data was received
+/// * `Err(...)` if any error occurred during connection or data reception
+async fn connect_to_websocket(
+    server_url: String, 
+    sender: flume::Sender<Vec<u8>>,
+    shared_state: Arc<SharedState>
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // Update state to connecting
+    {
+        let mut ws_state = shared_state.websocket_state.lock().unwrap();
+        ws_state.set_state(ConnectionState::Connecting);
+    }
+    
+    // Parse the URL
+    let url = match Url::parse(&server_url) {
+        Ok(url) => url,
+        Err(e) => {
+            let error_msg = format!("Invalid URL: {}", e);
+            let mut ws_state = shared_state.websocket_state.lock().unwrap();
+            ws_state.set_state(ConnectionState::Error(error_msg.clone()));
+            return Err(error_msg.into());
+        }
+    };
+    
+    // Configure the WebSocket
+    let mut config = WebSocketConfig::default();
+    config.max_message_size = None; // Allow unlimited message size
+    config.max_frame_size = None;   // Allow unlimited frame size
+    config.max_write_buffer_size = 1024 * 1024 * 10; // 10MB write buffer
+    
+    log::info!("Connecting to WebSocket server at {}", server_url);
+    
+    // Connect to the WebSocket server with the configuration
+    let (ws_stream, _) = match connect_async_with_config(url, Some(config), false).await {
+        Ok(result) => result,
+        Err(e) => {
+            let error_msg = format!("Failed to connect to WebSocket server: {}", e);
+            let mut ws_state = shared_state.websocket_state.lock().unwrap();
+            ws_state.set_state(ConnectionState::Error(error_msg.clone()));
+            return Err(error_msg.into());
+        }
+    };
+    
+    // Update state to connected
+    {
+        let mut ws_state = shared_state.websocket_state.lock().unwrap();
+        ws_state.set_state(ConnectionState::Connected);
+    }
+    
+    let (mut write, mut read) = ws_stream.split();
+    
+    log::info!("Connected to WebSocket server at {}", server_url);
+    log::info!("Waiting for message...");
+    
+    let start_time = Instant::now();
+    
+    // Update state to receiving
+    {
+        let mut ws_state = shared_state.websocket_state.lock().unwrap();
+        ws_state.set_state(ConnectionState::Receiving);
+    }
+    
+    // Wait for a binary message
+    if let Some(msg) = read.next().await {
+        match msg {
+            Ok(tokio_tungstenite::tungstenite::protocol::Message::Binary(bin_data)) => {
+                log::info!("Received binary message ({} compressed bytes)", bin_data.len());
+                
+                // Update progress
+                {
+                    let mut ws_state = shared_state.websocket_state.lock().unwrap();
+                    ws_state.update_progress(0.3);
+                }
+                
+                // Decompress the data using zstd
+                let mut decompressed_data = Vec::new();
+                match ZstdDecoder::new(Cursor::new(&bin_data)) {
+                    Ok(mut decoder) => {
+                        match decoder.read_to_end(&mut decompressed_data) {
+                            Ok(_) => {
+                                log::info!("Decompressed data in {:?}", start_time.elapsed());
+                                log::info!("Decompressed to {} bytes", decompressed_data.len());
+                                
+                                // Update progress
+                                {
+                                    let mut ws_state = shared_state.websocket_state.lock().unwrap();
+                                    ws_state.update_progress(0.6);
+                                }
+                                
+                                // Create a cursor to read the decompressed data
+                                let mut cursor = Cursor::new(&decompressed_data);
+                                
+                                // Try to deserialize as packed gaussians
+                                match deserialize_packed_gaussians(&mut cursor) {
+                                    Ok(packed) => {
+                                        log::info!("Successfully deserialized packed gaussians");
+                                        
+                                        // Update progress
+                                        {
+                                            let mut ws_state = shared_state.websocket_state.lock().unwrap();
+                                            ws_state.update_progress(0.8);
+                                        }
+                                        
+                                        // Unpack into a GaussianCloud
+                                        match unpack_gaussians(&packed) {
+                                            Ok(cloud) => {
+                                                log::info!("Successfully unpacked {} gaussians", cloud.num_points);
+                                                
+                                                // Update points received
+                                                {
+                                                    let mut ws_state = shared_state.websocket_state.lock().unwrap();
+                                                    ws_state.points_received = Some(cloud.num_points);
+                                                    ws_state.update_progress(0.9);
+                                                }
+                                                
+                                                // Send the decompressed data for further processing
+                                                match sender.send(decompressed_data) {
+                                                    Ok(_) => {
+                                                        // Mark as complete
+                                                        let mut ws_state = shared_state.websocket_state.lock().unwrap();
+                                                        ws_state.set_state(ConnectionState::Connected);
+                                                        ws_state.update_progress(1.0);
+                                                        return Ok(());
+                                                    },
+                                                    Err(e) => {
+                                                        let error_msg = format!("Failed to send data through channel: {}", e);
+                                                        let mut ws_state = shared_state.websocket_state.lock().unwrap();
+                                                        ws_state.set_state(ConnectionState::Error(error_msg.clone()));
+                                                        return Err(error_msg.into());
+                                                    }
+                                                }
+                                            },
+                                            Err(e) => {
+                                                let error_msg = format!("Failed to unpack gaussians: {}", e);
+                                                log::error!("{}", error_msg);
+                                                let mut ws_state = shared_state.websocket_state.lock().unwrap();
+                                                ws_state.set_state(ConnectionState::Error(error_msg.clone()));
+                                                return Err(error_msg.into());
+                                            }
+                                        }
+                                    },
+                                    Err(e) => {
+                                        let error_msg = format!("Failed to deserialize packed gaussians: {}", e);
+                                        log::error!("{}", error_msg);
+                                        
+                                        // Try a fallback - maybe it's a regular PLY/NPZ format?
+                                        log::info!("Falling back to treating as standard format data");
+                                        match sender.send(decompressed_data) {
+                                            Ok(_) => {
+                                                // Mark as complete but with warning
+                                                let mut ws_state = shared_state.websocket_state.lock().unwrap();
+                                                ws_state.set_state(ConnectionState::Connected);
+                                                ws_state.update_progress(1.0);
+                                                return Ok(());
+                                            },
+                                            Err(e) => {
+                                                let error_msg = format!("Failed to send data through channel: {}", e);
+                                                let mut ws_state = shared_state.websocket_state.lock().unwrap();
+                                                ws_state.set_state(ConnectionState::Error(error_msg.clone()));
+                                                return Err(error_msg.into());
+                                            }
+                                        }
+                                    }
+                                }
+                            },
+                            Err(e) => {
+                                let error_msg = format!("Failed to decompress data: {}", e);
+                                log::error!("{}", error_msg);
+                                let mut ws_state = shared_state.websocket_state.lock().unwrap();
+                                ws_state.set_state(ConnectionState::Error(error_msg.clone()));
+                                return Err(error_msg.into());
+                            }
+                        }
+                    },
+                    Err(e) => {
+                        let error_msg = format!("Failed to create zstd decoder: {}", e);
+                        log::error!("{}", error_msg);
+                        let mut ws_state = shared_state.websocket_state.lock().unwrap();
+                        ws_state.set_state(ConnectionState::Error(error_msg.clone()));
+                        return Err(error_msg.into());
+                    }
+                }
+            },
+            Ok(other) => {
+                let error_msg = format!("Received non-binary message from WebSocket: {:?}", other);
+                log::error!("{}", error_msg);
+                let mut ws_state = shared_state.websocket_state.lock().unwrap();
+                ws_state.set_state(ConnectionState::Error(error_msg.clone()));
+                return Err(error_msg.into());
+            },
+            Err(e) => {
+                let error_msg = format!("WebSocket error: {}", e);
+                log::error!("{}", error_msg);
+                let mut ws_state = shared_state.websocket_state.lock().unwrap();
+                ws_state.set_state(ConnectionState::Error(error_msg.clone()));
+                return Err(Box::new(e));
+            }
+        }
+    } else {
+        let error_msg = "WebSocket connection closed without receiving data".to_string();
+        log::error!("{}", error_msg);
+        let mut ws_state = shared_state.websocket_state.lock().unwrap();
+        ws_state.set_state(ConnectionState::Error(error_msg.clone()));
+        return Err(error_msg.into());
     }
 }
 

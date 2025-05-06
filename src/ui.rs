@@ -22,6 +22,9 @@ use egui::{emath::Numeric, Color32, RichText};
 #[cfg(not(target_arch = "wasm32"))]
 use egui_plot::{Legend, PlotPoints};
 
+#[cfg(not(target_arch = "wasm32"))]
+use crate::state::websocket::ConnectionState;
+
 // Helper function to render the loading state for WASM
 #[cfg(target_arch = "wasm32")]
 fn render_loading_ui(ui: &mut egui::Ui, loading_info: (bool, f32, Option<String>)) {
@@ -233,6 +236,122 @@ pub(crate) fn ui(state: &mut WindowContext) -> bool {
                         state.pc.mip_splatting().unwrap_or(false),
                     );
                     ui.end_row();
+                }
+
+                // Add WebSocket UI section at the end of the grid
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    ui.separator();
+                    ui.end_row();
+                    
+                    ui.collapsing("Live Updates", |ui| {
+                        ui.end_row();
+                        
+                        // Get a reference to the websocket state
+                        let mut ws_state = state.shared_state.websocket_state.lock().unwrap();
+                        
+                        // Server URL input
+                        ui.label("Server URL:");
+                        ui.horizontal(|ui| {
+                            let text_edit = ui.text_edit_singleline(&mut ws_state.server_url);
+                            
+                            // Dropdown for quick selection of common URLs
+                            let common_urls = ["ws://localhost:8765", "ws://127.0.0.1:8765"];
+                            ui.menu_button("🔽", |ui| {
+                                for url in common_urls {
+                                    if ui.button(url).clicked() {
+                                        ws_state.server_url = url.to_string();
+                                        ui.close_menu();
+                                    }
+                                }
+                            });
+                        });
+                        ui.end_row();
+                        
+                        // Connection status
+                        ui.label("Status:");
+                        ui.horizontal(|ui| {
+                            match ws_state.connection_state {
+                                ConnectionState::Disconnected => {
+                                    ui.colored_label(Color32::GRAY, "Disconnected");
+                                },
+                                ConnectionState::Connecting => {
+                                    ui.colored_label(Color32::YELLOW, "Connecting...");
+                                },
+                                ConnectionState::Connected => {
+                                    ui.colored_label(Color32::GREEN, "Connected");
+                                    if let Some(time) = ws_state.last_update_time {
+                                        let elapsed = std::time::Instant::now().duration_since(time);
+                                        ui.label(format!("Last update: {} secs ago", elapsed.as_secs()));
+                                    }
+                                    if let Some(points) = ws_state.points_received {
+                                        ui.label(format!("({} points)", format_thousands(points as u32)));
+                                    }
+                                },
+                                ConnectionState::Receiving => {
+                                    ui.colored_label(Color32::LIGHT_BLUE, "Receiving data...");
+                                    ui.spinner();
+                                },
+                                ConnectionState::Error(ref err) => {
+                                    ui.colored_label(Color32::RED, format!("Error: {}", err));
+                                },
+                            }
+                        });
+                        ui.end_row();
+                        
+                        // Auto-refresh checkbox and interval control
+                        ui.label("Auto refresh:");
+                        ui.horizontal(|ui| {
+                            ui.checkbox(&mut ws_state.auto_refresh, "");
+                            if ws_state.auto_refresh {
+                                ui.add(egui::DragValue::new(&mut ws_state.refresh_interval)
+                                    .speed(1.0)
+                                    .range(1..=60)
+                                    .suffix(" sec"));
+                            }
+                        });
+                        ui.end_row();
+                        
+                        // Refresh button (only enabled if not already connecting or receiving)
+                        ui.label("Manual refresh:");
+                        ui.horizontal(|ui| {
+                            let can_refresh = matches!(ws_state.connection_state, 
+                                                ConnectionState::Disconnected | 
+                                                ConnectionState::Connected | 
+                                                ConnectionState::Error(_));
+                            
+                            let refresh_button = ui.add_enabled(
+                                can_refresh,
+                                egui::Button::new(RichText::new("🔄 Refresh").strong())
+                            );
+                            
+                            if refresh_button.clicked() {
+                                // Mark refresh as requested (will be processed in update)
+                                let mut refresh_guard = state.shared_state.websocket_refresh_requested.lock().unwrap();
+                                *refresh_guard = true;
+                            }
+                            
+                            // Add a disconnect button if connected/connecting/receiving
+                            let can_disconnect = matches!(ws_state.connection_state, 
+                                                ConnectionState::Connected | 
+                                                ConnectionState::Connecting | 
+                                                ConnectionState::Receiving);
+                            
+                            if can_disconnect {
+                                let disconnect_button = ui.add(
+                                    egui::Button::new(RichText::new("⏹ Disconnect").strong().color(Color32::LIGHT_RED))
+                                );
+                                
+                                if disconnect_button.clicked() {
+                                    ws_state.set_state(ConnectionState::Disconnected);
+                                }
+                            }
+                        });
+                        ui.end_row();
+                        
+                        // Drop the lock as soon as possible
+                        drop(ws_state);
+                    });
                 }
             });
     });
