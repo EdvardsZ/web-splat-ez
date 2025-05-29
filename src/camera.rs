@@ -24,14 +24,49 @@ impl PerspectiveCamera {
     }
 
     pub fn fit_near_far(&mut self, aabb: &Aabb<f32>) {
-        // set camera near and far plane
-        let center = aabb.center();
-        let radius = aabb.radius();
-        let distance = self.position.distance(center);
-        let zfar = distance + radius;
-        let znear = (distance - radius).max(zfar / 1000.);
-        self.projection.zfar = zfar;
-        self.projection.znear = znear;
+        // Get the view direction (forward vector) from the camera rotation
+        let view_matrix = self.view_matrix();
+        let forward = Vector3::new(-view_matrix[0][2], -view_matrix[1][2], -view_matrix[2][2]).normalize();
+        
+        // Get all 8 corners of the bounding box
+        let corners = [
+            Point3::new(aabb.min.x, aabb.min.y, aabb.min.z),
+            Point3::new(aabb.max.x, aabb.min.y, aabb.min.z),
+            Point3::new(aabb.min.x, aabb.max.y, aabb.min.z),
+            Point3::new(aabb.max.x, aabb.max.y, aabb.min.z),
+            Point3::new(aabb.min.x, aabb.min.y, aabb.max.z),
+            Point3::new(aabb.max.x, aabb.min.y, aabb.max.z),
+            Point3::new(aabb.min.x, aabb.max.y, aabb.max.z),
+            Point3::new(aabb.max.x, aabb.max.y, aabb.max.z),
+        ];
+        
+        // Project all corners along the view direction to find min/max depth
+        let mut min_depth = f32::INFINITY;
+        let mut max_depth = f32::NEG_INFINITY;
+        
+        for corner in &corners {
+            let to_corner = corner - self.position;
+            let depth = to_corner.dot(forward);
+            min_depth = min_depth.min(depth);
+            max_depth = max_depth.max(depth);
+        }
+        
+        // Add some padding based on the field of view to account for splat extent
+        // Larger FOV means splats can extend further from their centers
+        let fov_factor = (self.projection.fovy.0.max(self.projection.fovx.0) * 0.5).tan();
+        let size = aabb.size();
+        let diagonal_length = (size.x * size.x + size.y * size.y + size.z * size.z).sqrt();
+        let padding = diagonal_length * fov_factor * 0.1; // 10% of diagonal scaled by FOV
+        
+        // Ensure we have reasonable near/far values
+        let znear = (min_depth - padding).max(0.001); // Minimum near plane
+        let zfar = (max_depth + padding).max(znear + 0.01); // Ensure far > near
+        
+        // Apply a safety margin to prevent clipping at the edges
+        let safety_margin = (zfar - znear) * 0.05; // 5% margin
+        
+        self.projection.znear = (znear - safety_margin).max(0.001);
+        self.projection.zfar = zfar + safety_margin;
     }
 }
 
