@@ -466,11 +466,11 @@ impl GPURSSorter {
         let scatter_blocks_ru = (keysize + scatter_block_kvs - 1) / scatter_block_kvs;
         let count_ru_scatter = scatter_blocks_ru * scatter_block_kvs;
 
-        // Calculate histogram block parameters using the scatter block size
-        // This ensures alignment between scatter and histogram phases
+        // Calculate histogram block parameters using the original safer calculation
+        // This ensures proper alignment and prevents buffer overruns
         let histo_block_kvs = HISTOGRAM_WG_SIZE * RS_HISTOGRAM_BLOCK_ROWS;
-        let histo_blocks_ru = scatter_blocks_ru; // Since RS_SCATTER_BLOCK_ROWS = RS_HISTOGRAM_BLOCK_ROWS
-        let count_ru_histo = count_ru_scatter;
+        let histo_blocks_ru = (count_ru_scatter + histo_block_kvs - 1) / histo_block_kvs;
+        let count_ru_histo = histo_blocks_ru * histo_block_kvs;
 
         return (
             scatter_block_kvs,
@@ -533,8 +533,8 @@ impl GPURSSorter {
 
         let histo_size = RS_RADIX_SIZE * std::mem::size_of::<u32>();
         
-        // Exact calculation of needed memory without extra safety padding
-        let internal_size = (RS_KEYVAL_SIZE + scatter_blocks_ru - 1) * histo_size;
+        // Add safety buffer to prevent buffer overruns at high load (like 100% splats)
+        let internal_size = (RS_KEYVAL_SIZE + scatter_blocks_ru - 1 + 1) * histo_size; // +1 safety
 
         let buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Internal radix sort buffer"),
